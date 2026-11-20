@@ -22,9 +22,6 @@
           decky-store-proxy = ./nix/module.nix;
           default = self.nixosModules.decky-store-proxy;
         };
-        overlays.default = final: _prev: {
-          decky-store-proxy = final.callPackage ./nix/package.nix { };
-        };
       };
 
       perSystem =

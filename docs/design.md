@@ -1,0 +1,85 @@
+# How decky-store-proxy works
+
+```
+Decky (Steam UI) ──► decky-store-proxy (127.0.0.1:8737) ──► plugins.deckbrew.xyz
+                              │
+                              └─► GitHub: org/user repo lists + decky-store.json per repo
+```
+
+## Decky's store protocol
+
+The Decky store base URL (here `http://127.0.0.1:8737/plugins`) serves:
+
+| request | made by | |
+|---|---|---|
+| `GET /plugins?sort_by=…&sort_direction=…` | Steam UI | plugin list |
+| `GET /plugins/versions` | Steam UI | latest version per plugin, for update notifications |
+| `POST /plugins/{name}/versions/{version}/increment` | Decky's backend | install counter |
+
+Decky downloads a version's `artifact` URL and checks its `sha256`.
+
+## Pass-through
+
+Requests are forwarded to `upstream` with path, query, body and status
+unchanged. If no custom plugins are known, every request is passed through.
+
+The Steam UI fetches from `https://steamloopback.host`, so responses need CORS
+headers. The proxy answers preflight requests itself and sets the same policy
+as the official store (that origin only, with credentials). It also answers
+Private Network Access preflights, which the current Steam client does not send.
+
+## Discovery
+
+Every `refreshInterval`, and on `POST /_proxy/refresh`:
+
+1. The public, non-archived repos of each configured org (`/orgs/{org}/repos`)
+   and user (`/users/{user}/repos?type=owner`) with at least one configured
+   topic are listed through the GitHub API, using ETags. Repos from `repos`
+   are added without the topic check.
+2. For each repo, `https://github.com/<repo>/releases/latest/download/decky-store.json`
+   is downloaded. This is a normal download, not an API call. Missing or
+   invalid manifests are logged and the repo is skipped.
+3. Decky's store card looks up the installed version in the plugin's version
+   list; if it isn't there, an update is labelled as a downgrade. So when a
+   repo's latest release changes, its release list is fetched once through the
+   API (`/repos/{repo}/releases`) and the manifests of older stable releases
+   are added. Unchanged repos cost no API calls.
+4. Name conflicts are resolved: `repos` beat org and user repos; two org/user
+   repos with the same name are both dropped.
+
+Failures don't empty the store:
+
+- If listing an org or user fails, its previously found plugins are kept.
+- If a manifest can't be downloaded, the repo's previous entry is kept.
+- If the release history can't be fetched, the known versions are kept and
+  the fetch is retried on the next refresh.
+- The catalog is saved to `cacheDir/catalog.json` and loaded on start, so the
+  store also works across restarts and while GitHub is unreachable. Cached
+  plugins whose source is no longer configured are dropped.
+
+## Merging
+
+- `GET /plugins`: upstream plugins with the same name as a custom plugin are
+  removed. Custom plugins are inserted into the upstream list according to
+  `sort_by` (`name`, `date` or `downloads`) and `sort_direction`, without
+  reordering upstream entries. They get stable negative ids. The `query` and
+  `tags` filters are applied to custom plugins too. If upstream is down, only
+  custom plugins are listed; upstream 4xx responses (e.g. 426 for old Decky
+  versions) are passed through.
+- `GET /plugins/versions`: custom plugins are added as
+  `[version, sha256, artifact]`.
+- Install counter requests for custom plugins are answered locally, so they
+  don't count installs for an unrelated upstream plugin of the same name.
+
+## Development
+
+```bash
+go test -race ./...
+```
+
+```bash
+nix flake check
+```
+
+`nix develop` provides Go and gopls. The flake's `checks.<system>.module`
+builds the systemd unit from an example NixOS configuration.
