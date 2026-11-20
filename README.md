@@ -20,6 +20,10 @@ Decky (Steam UI) ──► decky-store-proxy (127.0.0.1:8737) ──► plugins.
   `https://github.com/<repo>/releases/latest/download/decky-store.json`.
   That is a plain download, not an API call. The only API call is the org
   listing, which uses ETags, so 60 requests/hour unauthenticated is plenty.
+* When a repo's latest release changes, the proxy also lists its releases (one
+  API call) to offer every stable version. Decky needs the installed version
+  in that list to label an install as an update rather than a downgrade.
+  Unchanged repos cost no API calls.
 * Those plugins are merged into `GET /plugins` (respecting `sort_by` /
   `sort_direction`) and `GET /plugins/versions`, so installs **and update
   notifications** work. Install counter POSTs for them are answered locally.
@@ -192,7 +196,13 @@ Recommended org settings:
 
 * Only repos with a published release containing `decky-store.json` are shown.
   Third-party plugins without one must be forked and released through the workflow.
-* Only the latest version of each custom plugin is offered (no version picker history).
+* Version history covers the newest 100 releases. Releases made without the
+  workflow (no `decky-store.json`) and prereleases are not offered.
 * Plugin repos must be public, because Decky downloads the zip without credentials.
 * New releases appear after at most `refreshInterval`, or immediately with `POST /_proxy/refresh`.
+  GitHub's "latest release" download link can lag a release by about a minute.
 * Removing a repo hides it from the store. Installed copies stay, without updates.
+
+## License
+
+[The Unlicense](UNLICENSE): public domain.

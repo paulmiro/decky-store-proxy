@@ -248,9 +248,31 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request, cat *Cat
 // storeEntry renders a custom plugin in the upstream store's list format.
 func storeEntry(e *Entry) map[string]any {
 	m := e.Manifest
-	var created any
-	if !m.Created.IsZero() {
-		created = m.Created.UTC().Format(time.RFC3339)
+	ts := func(t time.Time) any {
+		if t.IsZero() {
+			return nil
+		}
+		return t.UTC().Format(time.RFC3339)
+	}
+	versions := e.versions()
+	// Like upstream: created = first release, updated = latest release.
+	var first time.Time
+	for _, v := range versions {
+		if !v.Created.IsZero() && (first.IsZero() || v.Created.Before(first)) {
+			first = v.Created
+		}
+	}
+	created, updated := ts(first), ts(m.Created)
+	var vs []map[string]any
+	for _, v := range versions {
+		vs = append(vs, map[string]any{
+			"name":      v.Version,
+			"hash":      v.SHA256,
+			"artifact":  v.Artifact,
+			"created":   ts(v.Created),
+			"downloads": 0,
+			"updates":   0,
+		})
 	}
 	tags := m.Tags
 	if tags == nil {
@@ -267,15 +289,8 @@ func storeEntry(e *Entry) map[string]any {
 		"downloads":   0,
 		"updates":     0,
 		"created":     created,
-		"updated":     created,
-		"versions": []map[string]any{{
-			"name":      m.Version,
-			"hash":      m.SHA256,
-			"artifact":  m.Artifact,
-			"created":   created,
-			"downloads": 0,
-			"updates":   0,
-		}},
+		"updated":     updated,
+		"versions":    vs,
 	}
 }
 
@@ -395,10 +410,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	cat := s.disc.Catalog()
 	type plugin struct {
 		Name, Version, Repo, Source, Artifact string
+		Versions                              []string
+		HistoryComplete                       bool
 	}
 	ps := []plugin{}
 	for _, e := range cat.Plugins {
-		ps = append(ps, plugin{e.Manifest.Name, e.Manifest.Version, e.Repo, e.Source, e.Manifest.Artifact})
+		var vs []string
+		for _, v := range e.versions() {
+			vs = append(vs, v.Version)
+		}
+		ps = append(ps, plugin{e.Manifest.Name, e.Manifest.Version, e.Repo, e.Source, e.Manifest.Artifact, vs, e.HistoryComplete})
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)

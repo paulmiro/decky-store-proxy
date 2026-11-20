@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,8 +67,24 @@ func (m *Manifest) validate() error {
 // Entry is one discovered custom plugin.
 type Entry struct {
 	Repo     string   `json:"repo"`
-	Source   string   `json:"source"` // "org:<name>" or "extra"
-	Manifest Manifest `json:"manifest"`
+	Source   string   `json:"source"`   // "org:<name>" or "extra"
+	Manifest Manifest `json:"manifest"` // latest release
+
+	// History holds all stable releases, newest first, including Manifest.
+	// Decky's store card needs the installed version in this list, or it
+	// labels the update as a "downgrade".
+	History []Manifest `json:"history,omitempty"`
+	// HistoryComplete is false if the release list couldn't be fetched; it is
+	// retried on the next refresh.
+	HistoryComplete bool `json:"historyComplete,omitempty"`
+}
+
+// versions returns all known versions, newest first.
+func (e *Entry) versions() []Manifest {
+	if len(e.History) == 0 {
+		return []Manifest{e.Manifest}
+	}
+	return e.History
 }
 
 // id returns a stable negative id so it can never collide with upstream ids.
@@ -258,7 +275,12 @@ func (d *Discoverer) Refresh(ctx context.Context) *Catalog {
 			m, err := d.fetchManifest(ctx, r.name)
 			switch {
 			case err == nil:
-				results[i].entry = &Entry{Repo: r.name, Source: r.source, Manifest: *m}
+				prev, hasPrev := prevByRepo[strings.ToLower(r.name)]
+				e, histErr := d.withHistory(ctx, Entry{Repo: r.name, Source: r.source, Manifest: *m}, prev, hasPrev)
+				results[i].entry = &e
+				if histErr != nil {
+					results[i].err = fmt.Sprintf("%s: release history: %v (will retry)", r.name, histErr)
+				}
 			case errors.Is(err, errNoRelease):
 				results[i].err = fmt.Sprintf("%s: no release with %s", r.name, manifestAsset)
 			case errors.Is(err, errInvalid):
@@ -425,7 +447,151 @@ func (d *Discoverer) getAPI(ctx context.Context, url string) ([]byte, error) {
 }
 
 func (d *Discoverer) fetchManifest(ctx context.Context, repo string) (*Manifest, error) {
-	url := fmt.Sprintf("%s/%s/releases/latest/download/%s", d.cfg.githubWeb, repo, manifestAsset)
+	return d.fetchManifestURL(ctx, fmt.Sprintf("%s/%s/releases/latest/download/%s", d.cfg.githubWeb, repo, manifestAsset))
+}
+
+// withHistory fills e.History. The releases API is only called when the
+// latest release changed (or the history is incomplete), so a steady state
+// costs no API requests per repo.
+func (d *Discoverer) withHistory(ctx context.Context, e Entry, prev Entry, hasPrev bool) (Entry, error) {
+	var known []Manifest
+	if hasPrev && prev.Manifest.Name == e.Manifest.Name {
+		known = prev.versions()
+		if prev.HistoryComplete && prev.Manifest.Version == e.Manifest.Version && prev.Manifest.SHA256 == e.Manifest.SHA256 {
+			e.History, e.HistoryComplete = prev.History, true
+			return e, nil
+		}
+	}
+	hist, err := d.fetchHistory(ctx, e.Repo, e.Manifest, known)
+	if err != nil {
+		// Degrade gracefully: latest plus whatever older versions we knew.
+		hist = []Manifest{e.Manifest}
+		for _, k := range known {
+			if compareSemver(k.Version, e.Manifest.Version) < 0 {
+				hist = append(hist, k)
+			}
+		}
+		e.History = hist
+		return e, err
+	}
+	e.History, e.HistoryComplete = hist, true
+	return e, nil
+}
+
+type ghRelease struct {
+	TagName    string `json:"tag_name"`
+	Draft      bool   `json:"draft"`
+	Prerelease bool   `json:"prerelease"`
+	Assets     []struct {
+		Name string `json:"name"`
+		URL  string `json:"browser_download_url"`
+	} `json:"assets"`
+}
+
+// fetchHistory returns latest plus all older stable releases of the same
+// plugin, newest first. Manifests in known are reused instead of downloaded.
+func (d *Discoverer) fetchHistory(ctx context.Context, repo string, latest Manifest, known []Manifest) ([]Manifest, error) {
+	body, err := d.getAPI(ctx, fmt.Sprintf("%s/repos/%s/releases?per_page=100", d.cfg.githubAPI, repo))
+	if err != nil {
+		return nil, err
+	}
+	var rels []ghRelease
+	if err := json.Unmarshal(body, &rels); err != nil {
+		return nil, fmt.Errorf("decoding release list: %w", err)
+	}
+	byVersion := map[string]Manifest{}
+	for _, k := range known {
+		byVersion[k.Version] = k
+	}
+	hist := []Manifest{latest}
+	seen := map[string]bool{latest.Version: true}
+	for _, rel := range rels {
+		v := strings.TrimPrefix(rel.TagName, "v")
+		if rel.Draft || rel.Prerelease || seen[v] || !semverRe.MatchString(v) || compareSemver(v, latest.Version) > 0 {
+			continue
+		}
+		if k, ok := byVersion[v]; ok {
+			hist = append(hist, k)
+			seen[v] = true
+			continue
+		}
+		var url string
+		for _, a := range rel.Assets {
+			if a.Name == manifestAsset {
+				url = a.URL
+			}
+		}
+		if url == "" {
+			continue // released before using the workflow
+		}
+		m, err := d.fetchManifestURL(ctx, url)
+		switch {
+		case errors.Is(err, errInvalid) || errors.Is(err, errNoRelease):
+			slog.Warn("skipping old release", "repo", repo, "tag", rel.TagName, "err", err)
+			continue
+		case err != nil:
+			return nil, err
+		case m.Version != v || m.Name != latest.Name:
+			slog.Warn("skipping old release with mismatched manifest", "repo", repo, "tag", rel.TagName, "name", m.Name, "version", m.Version)
+			continue
+		}
+		hist = append(hist, *m)
+		seen[v] = true
+	}
+	slices.SortStableFunc(hist, func(a, b Manifest) int { return compareSemver(b.Version, a.Version) })
+	return hist, nil
+}
+
+// compareSemver compares two SemVer strings (assumed valid) by precedence.
+func compareSemver(a, b string) int {
+	pa, pb := semverRe.FindStringSubmatch(a), semverRe.FindStringSubmatch(b)
+	if pa == nil || pb == nil {
+		return strings.Compare(a, b)
+	}
+	for i := 1; i <= 3; i++ {
+		if c := compareNumeric(pa[i], pb[i]); c != 0 {
+			return c
+		}
+	}
+	switch preA, preB := pa[4], pb[4]; {
+	case preA == preB:
+		return 0
+	case preA == "":
+		return 1
+	case preB == "":
+		return -1
+	default:
+		fa, fb := strings.Split(preA, "."), strings.Split(preB, ".")
+		for i := 0; i < len(fa) && i < len(fb); i++ {
+			na, errA := strconv.Atoi(fa[i])
+			nb, errB := strconv.Atoi(fb[i])
+			var c int
+			switch {
+			case errA == nil && errB == nil:
+				c = na - nb
+			case errA == nil:
+				c = -1
+			case errB == nil:
+				c = 1
+			default:
+				c = strings.Compare(fa[i], fb[i])
+			}
+			if c != 0 {
+				return max(-1, min(1, c))
+			}
+		}
+		return len(fa) - len(fb)
+	}
+}
+
+func compareNumeric(a, b string) int {
+	if len(a) != len(b) {
+		return len(a) - len(b) // no leading zeros in SemVer
+	}
+	return strings.Compare(a, b)
+}
+
+func (d *Discoverer) fetchManifestURL(ctx context.Context, url string) (*Manifest, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

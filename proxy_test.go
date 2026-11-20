@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -96,12 +97,20 @@ type fakeGitHub struct {
 	repos     []ghRepo
 	manifests map[string]string // repo -> body; missing = 404
 	failing   map[string]bool   // repo -> 500
-	apiCalls  int
+	releases  map[string][]fakeRelease
+	apiCalls  int // org listing
+	relCalls  int // release listing
 	apiDown   bool
 }
 
+type fakeRelease struct {
+	tag               string
+	prerelease, draft bool
+	manifest          string // "" = no decky-store.json asset
+}
+
 func newFakeGitHub(t *testing.T) *fakeGitHub {
-	g := &fakeGitHub{manifests: map[string]string{}, failing: map[string]bool{}}
+	g := &fakeGitHub{manifests: map[string]string{}, failing: map[string]bool{}, releases: map[string][]fakeRelease{}}
 	g.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		defer g.mu.Unlock()
@@ -117,6 +126,36 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 			}
 			w.Header().Set("ETag", `"v1"`)
 			json.NewEncoder(w).Encode(g.repos)
+			return
+		}
+		if rest, ok := strings.CutPrefix(r.URL.Path, "/api/repos/"); ok {
+			repo := strings.TrimSuffix(rest, "/releases")
+			g.relCalls++
+			if g.apiDown {
+				w.Header().Set("X-RateLimit-Remaining", "0")
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			out := []map[string]any{}
+			for _, rel := range g.releases[repo] {
+				assets := []map[string]string{}
+				if rel.manifest != "" {
+					assets = append(assets, map[string]string{"name": "decky-store.json", "browser_download_url": g.URL + "/assets/" + repo + "@" + rel.tag})
+				}
+				out = append(out, map[string]any{"tag_name": rel.tag, "prerelease": rel.prerelease, "draft": rel.draft, "assets": assets})
+			}
+			json.NewEncoder(w).Encode(out)
+			return
+		}
+		if rest, ok := strings.CutPrefix(r.URL.Path, "/assets/"); ok && strings.Contains(rest, "@") {
+			repo, tag, _ := strings.Cut(rest, "@")
+			for _, rel := range g.releases[repo] {
+				if rel.tag == tag {
+					io.WriteString(w, rel.manifest)
+					return
+				}
+			}
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		// /<owner>/<repo>/releases/latest/download/decky-store.json -> redirect like GitHub
@@ -494,6 +533,91 @@ func TestManifestValidation(t *testing.T) {
 		mut(&m)
 		if m.validate() == nil {
 			t.Errorf("accepted %+v", m)
+		}
+	}
+}
+
+// Regression: Decky labels an update "downgrade" if the installed version is
+// missing from the store's versions list, so all releases must be listed.
+func TestReleaseHistory(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.ExtraRepos = []string{"o/p"} })
+	m010 := manifest("P", "0.1.0", "o/p", "2026-01-01T00:00:00Z")
+	m011 := manifest("P", "0.1.1", "o/p", "2026-02-01T00:00:00Z")
+	m012 := manifest("P", "0.1.2", "o/p", "2026-03-01T00:00:00Z")
+	h.gh.manifests["o/p"] = m011
+	h.gh.releases["o/p"] = []fakeRelease{
+		{tag: "v0.2.0-rc.1", prerelease: true, manifest: manifest("P", "0.2.0-rc.1", "o/p", "")},
+		{tag: "v0.1.1", manifest: m011},
+		{tag: "v0.1.0", manifest: m010},
+		{tag: "v0.0.9"}, // pre-workflow release without manifest
+	}
+	versionsOf := func() string {
+		_, body := h.do(t, "GET", "/plugins?sort_by=name", steam)
+		var list []map[string]any
+		json.Unmarshal([]byte(body), &list)
+		for _, p := range list {
+			if p["name"] == "P" {
+				var vs []string
+				for _, v := range p["versions"].([]any) {
+					vs = append(vs, v.(map[string]any)["name"].(string))
+				}
+				return fmt.Sprintf("%v created=%v updated=%v", vs, p["created"], p["updated"])
+			}
+		}
+		return "missing"
+	}
+
+	h.disc.Refresh(context.Background())
+	if got := versionsOf(); got != "[0.1.1 0.1.0] created=2026-01-01T00:00:00Z updated=2026-02-01T00:00:00Z" {
+		t.Fatalf("got %s", got)
+	}
+	if h.gh.relCalls != 1 {
+		t.Fatalf("release API calls = %d", h.gh.relCalls)
+	}
+
+	// Unchanged latest release: no API call.
+	h.disc.Refresh(context.Background())
+	if h.gh.relCalls != 1 {
+		t.Fatalf("history refetched although nothing changed (%d calls)", h.gh.relCalls)
+	}
+
+	// New release while the API is rate limited: degrade, then recover.
+	h.gh.mu.Lock()
+	h.gh.manifests["o/p"] = m012
+	h.gh.releases["o/p"] = append([]fakeRelease{{tag: "v0.1.2", manifest: m012}}, h.gh.releases["o/p"]...)
+	h.gh.apiDown = true
+	h.gh.mu.Unlock()
+	cat := h.disc.Refresh(context.Background())
+	if e := cat.lookup("P"); e == nil || e.HistoryComplete || len(e.History) != 3 {
+		t.Fatalf("fallback history: %+v", e)
+	}
+	h.gh.mu.Lock()
+	h.gh.apiDown = false
+	h.gh.mu.Unlock()
+	h.disc.Refresh(context.Background())
+	if got := versionsOf(); !strings.HasPrefix(got, "[0.1.2 0.1.1 0.1.0]") {
+		t.Fatalf("got %s", got)
+	}
+	if e := h.disc.Catalog().lookup("P"); !e.HistoryComplete {
+		t.Fatal("history not completed after recovery")
+	}
+
+	// /versions only carries the latest.
+	_, body := h.do(t, "GET", "/plugins/versions", steam)
+	if !strings.Contains(body, `"P":["0.1.2"`) {
+		t.Fatalf("versions = %s", body)
+	}
+}
+
+func TestCompareSemver(t *testing.T) {
+	ordered := []string{"0.9.9", "0.10.0", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0", "1.0.1", "10.0.0"}
+	for i := range ordered {
+		for j := range ordered {
+			got := compareSemver(ordered[i], ordered[j])
+			want := cmp.Compare(i, j)
+			if (got > 0) != (want > 0) || (got < 0) != (want < 0) {
+				t.Errorf("compare(%s, %s) = %d, want sign %d", ordered[i], ordered[j], got, want)
+			}
 		}
 	}
 }
