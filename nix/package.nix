@@ -27,6 +27,7 @@ buildGoModule (finalAttrs: {
 
   meta = {
     description = "Pull-through Decky Loader plugin store that adds plugins from GitHub releases";
+    license = lib.licenses.unlicense;
     mainProgram = "decky-store-proxy";
     platforms = lib.platforms.linux;
   };
