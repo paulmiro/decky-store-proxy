@@ -20,6 +20,7 @@ A plugin repository must:
    - `plugin.json` `name` is the plugin's identity. Decky matches installed
      plugins to store entries by this name, so it must never change.
 4. Release through the reusable workflow (or produce the same assets).
+5. Work on NixOS as well as SteamOS. See [Working on NixOS](#working-on-nixos).
 
 ## Releasing
 
@@ -115,6 +116,104 @@ at all, and the proxy reports the problem in `/_proxy/status`.
 
 Plugins from third parties that don't publish this format can be forked and
 released through the workflow.
+
+## Working on NixOS
+
+Plugins from the proxy must work on NixOS ([Jovian-NixOS](https://github.com/Jovian-Experiments/Jovian-NixOS))
+as well as on SteamOS. They must work with Jovian's **default**
+`jovian.decky-loader` settings: a plugin can't expect users to add packages or
+change options for it. The frontend runs in the Steam client and behaves the
+same on both systems. The differences all concern the Python backend and
+anything it runs.
+
+### The environment on Jovian-NixOS
+
+| | SteamOS | Jovian-NixOS (defaults) |
+|---|---|---|
+| Decky | release binary (PyInstaller) | built from source as a NixOS service |
+| Python | bundled with Decky (3.14 as of Decky 3.3) | nixpkgs' `python3` (3.14 on unstable, older on stable NixOS releases) |
+| plugin directory | `/home/deck/homebrew/plugins` | `/var/lib/decky-loader/plugins` |
+| backend user | `deck` (`root` with the `_root` flag) | `decky`, a system user (`root` with the `_root` flag) |
+| `DECKY_USER` / `DECKY_USER_HOME` | `deck` / `/home/deck` | `decky` / `/var/lib/decky-loader` |
+| `DECKY_HOME` | `/home/deck/homebrew` | `/var/lib/decky-loader` |
+| `PATH` | the full SteamOS system | coreutils, findutils, grep, sed, systemd and psmisc **only** |
+| FHS paths | `/usr/bin`, `/usr/lib`, `/lib64`, … | only `/bin/sh` and `/usr/bin/env` |
+
+### Paths
+
+- Never hardcode `/home/deck`, `~/homebrew` or any other path. Use the
+  variables of the `decky` module: `DECKY_PLUGIN_DIR`,
+  `DECKY_PLUGIN_SETTINGS_DIR`, `DECKY_PLUGIN_RUNTIME_DIR`,
+  `DECKY_PLUGIN_LOG_DIR`.
+- `DECKY_USER_HOME` is **not** the Steam user's home on Jovian. The Steam user
+  is configured separately, and their home is only readable by them
+  (mode 700). To find Steam's files, look up the user that runs Steam, for
+  example from the `steam` process:
+
+  ```python
+  import os, pwd
+
+  def steam_user_home() -> str | None:
+      for pid in filter(str.isdigit, os.listdir("/proc")):
+          try:
+              with open(f"/proc/{pid}/comm") as f:
+                  if f.read().strip() != "steam":
+                      continue
+              return pwd.getpwuid(os.stat(f"/proc/{pid}").st_uid).pw_dir
+          except (OSError, KeyError):
+              continue
+      return None
+  ```
+
+  Reading files in that home requires the `_root` flag on Jovian.
+- Don't write to `/etc`, `/usr` or other system locations. On NixOS they are
+  generated from the system configuration and read-only (or overwritten on the
+  next rebuild). Keep all state in the plugin's settings, runtime and log
+  directories.
+- Don't install systemd units or udev rules. Run helper processes from the
+  backend instead, or, as root, as transient units with `systemd-run`.
+
+### Python
+
+- Only the standard library and Decky's own dependencies are guaranteed:
+  `aiohttp`, `aiohttp-cors`, `aiohttp-jinja2`, `certifi`, `multidict`,
+  `packaging`, `setproctitle`, `watchdog` and what they depend on.
+- Ship everything else in `py_modules/`, which Decky adds to `sys.path`.
+  Only use **pure-Python** packages there. Compiled extension modules (`.so`
+  files) are built for one Python version and expect a regular Linux system;
+  the Python version differs between SteamOS and NixOS, and also between
+  NixOS releases.
+- Don't use syntax or standard library features newer than the oldest Python
+  you want to support. NixOS 25.11's `python3` is 3.13.
+
+### Binaries and scripts
+
+- Every executable you ship in `bin/` or download as a `remote_binary` must be
+  **statically linked**. Dynamically linked programs fail on NixOS with
+  "No such file or directory", because the dynamic loader
+  (`/lib64/ld-linux-x86-64.so.2`) doesn't exist there. The same applies to
+  AppImages.
+  - Go: `CGO_ENABLED=0 go build`
+  - Rust: `cargo build --release --target x86_64-unknown-linux-musl`
+  - C/C++: build against musl with `-static` (e.g. `musl-gcc -static` or
+    `zig cc -target x86_64-linux-musl`)
+  - Check with `file <binary>` ("statically linked") or `ldd <binary>`
+    ("not a dynamic executable").
+- Shell scripts must start with `#!/bin/sh` and be POSIX sh. `/bin/bash`
+  doesn't exist and `bash` isn't on Decky's `PATH`.
+- Don't call system tools that aren't in the `PATH` above: no `curl`,
+  `wget`, `unzip`, `tar`, `flatpak`, `pactl`, `steamos-*` helpers and so on.
+  Prefer the standard library (`urllib`, `zipfile`, `tarfile`, `shutil`,
+  `subprocess` with your own static binary) or `aiohttp`. If a tool is optional,
+  check for it with `shutil.which()` and degrade with a clear message.
+- Call executables by name (resolved through `PATH`) or by their path inside
+  the plugin directory, never by an absolute system path such as `/usr/bin/…`.
+
+### Testing
+
+Test every release on a Jovian-NixOS machine with only
+`jovian.decky-loader.enable = true`, in addition to SteamOS. Check the backend
+log (`DECKY_PLUGIN_LOG_DIR`, or `journalctl -u decky-loader`) for errors.
 
 ## Securing an org
 
