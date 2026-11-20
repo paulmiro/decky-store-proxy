@@ -8,18 +8,19 @@ it is a pure pass-through: Decky behaves exactly as with the official store.
 ```
 Decky (Steam UI) ──► decky-store-proxy (127.0.0.1:8737) ──► plugins.deckbrew.xyz
                               │
-                              └─► GitHub: org repo list + decky-store.json per repo
+                              └─► GitHub: org/user repo lists + decky-store.json per repo
 ```
 
 ## How it works
 
 * Requests go to `upstream` unchanged (path, query, body, status).
 * Each `refreshInterval`, the proxy lists the public, non-archived repos of each
-  configured org that carry the `decky-plugin` topic, plus every `extraRepos`
-  entry, and downloads
+  configured org and user that carry at least one of the configured topics,
+  adds every explicitly listed repo, and downloads
   `https://github.com/<repo>/releases/latest/download/decky-store.json`.
-  That is a plain download, not an API call. The only API call is the org
-  listing, which uses ETags, so 60 requests/hour unauthenticated is plenty.
+  That is a plain download, not an API call. The API is only used to list
+  each org's and user's repos (with ETags), so 60 requests/hour
+  unauthenticated is plenty for a few owners.
 * When a repo's latest release changes, the proxy also lists its releases (one
   API call) to offer every stable version. Decky needs the installed version
   in that list to label an install as an update rather than a downgrade.
@@ -33,18 +34,23 @@ Decky (Steam UI) ──► decky-store-proxy (127.0.0.1:8737) ──► plugins.
   proxy answers preflights itself and sets the same policy as the upstream store.
 
 Robustness:
-* If GitHub fails, the previous data for that org or repo is kept.
+* If GitHub fails, the previous data for that org, user or repo is kept.
 * The last good catalog is saved to `cacheDir`, so the store works across restarts and while offline.
 * If upstream is down, your own plugins are still listed.
 
-Precedence for duplicate plugin names: `extraRepos` > org repos > upstream.
-Two org repos claiming the same name are both skipped and logged.
+Precedence for duplicate plugin names: explicit `repos` > org and user repos >
+upstream. Two org/user repos claiming the same name are both skipped and logged.
 
 Debug endpoints:
 
 ```bash
 curl -s http://127.0.0.1:8737/_proxy/status
 ```
+
+It shows the configured sources (and whether a GitHub token is in use), the
+discovered plugins with their versions and the source that found them
+(`github:org:<name>`, `github:user:<name>` or `github:repo`), and the errors
+of the last refresh. `POST /_proxy/refresh` refreshes now and returns the same.
 
 ```bash
 curl -s -X POST http://127.0.0.1:8737/_proxy/refresh
@@ -61,17 +67,37 @@ Requires Decky Loader ≥ 3.3.0, the upstream store's minimum.
 TOML, see [`config.example.toml`](config.example.toml). Default path
 `~/.config/decky-store-proxy/config.toml`, or pass `-config <path>`. Unknown keys are an error.
 
+```toml
+port = 8737
+
+[sources.github]
+orgs = ["some-org-name"]
+users = ["some-username"]
+repos = ["other-user/myplugin", "other-org/theplugin"]
+topics = ["decky-plugin"]
+```
+
+Top level:
+
 | key | default | |
 |---|---|---|
 | `listenAddress` | `127.0.0.1` | |
 | `port` | `8737` | |
-| `orgs` | `[]` | GitHub orgs to scan |
-| `extraRepos` | `[]` | `owner/repo` or GitHub URLs |
-| `topic` | `decky-plugin` | required topic for org repos |
 | `refreshInterval` | `15m` | Go duration, ≥ 1m |
-| `upstream` | `https://plugins.deckbrew.xyz/plugins` | |
-| `githubTokenFile` | unset | falls back to `$GITHUB_TOKEN` |
+| `upstream` | `https://plugins.deckbrew.xyz/plugins` | the official store |
 | `cacheDir` | `$CACHE_DIRECTORY` or `~/.cache/decky-store-proxy` | |
+
+`[sources.github]`:
+
+| key | default | |
+|---|---|---|
+| `orgs` | `[]` | organizations to scan |
+| `users` | `[]` | users to scan (only repos they own) |
+| `repos` | `[]` | `owner/repo` or GitHub URLs, always included, no topic needed |
+| `topics` | `["decky-plugin"]` | an org/user repo needs **at least one**; `[]` is an error |
+| `tokenFile` | unset | GitHub token file; falls back to `$GITHUB_TOKEN` |
+
+The proxy is a pure pass-through when `orgs`, `users` and `repos` are all empty.
 
 ## NixOS (incl. Jovian-NixOS)
 
@@ -87,15 +113,18 @@ imports = [ inputs.decky-store-proxy.nixosModules.default ];
 services.decky-store-proxy = {
   enable = true;
   settings = {
-    orgs = [ "paulmiro-decky-store" ];
-    extraRepos = [ ];
+    sources.github = {
+      orgs = [ "paulmiro-decky-store" ];
+      # users = [ ]; repos = [ ]; topics = [ "decky-plugin" ];
+      # tokenFile = "/run/secrets/github-token";
+    };
     # port = 8737; listenAddress = "127.0.0.1";
     # any other config key works too, e.g. refreshInterval = "30m";
   };
 };
 ```
 
-The service runs with `DynamicUser` and is sandboxed. A `githubTokenFile`
+The service runs with `DynamicUser` and is sandboxed. A `sources.github.tokenFile`
 may be root-only: it's handed over as a systemd credential.
 
 Flake outputs:
@@ -137,8 +166,8 @@ The second command keeps the service running outside a desktop session.
 
 Every plugin repo:
 
-1. Is public, in a configured org, with the GitHub topic `decky-plugin`
-   (`extraRepos` don't need the topic).
+1. Is public, owned by a configured org or user, with a configured topic
+   (default `decky-plugin`). Repos listed in `repos` don't need the topic.
 2. Has `package.json` (`version`, strict SemVer) and `plugin.json` (`name`)
    at the root. The plugin template's layout works as-is.
 3. Releases via the reusable workflow in this repo:

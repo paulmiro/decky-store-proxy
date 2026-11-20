@@ -75,7 +75,7 @@ func run(configPath string) error {
 	errc := make(chan error, 1)
 	go func() { errc <- hs.ListenAndServe() }()
 	slog.Info("listening", "url", fmt.Sprintf("http://%s%s", cfg.addr(), basePath),
-		"upstream", cfg.Upstream, "orgs", cfg.Orgs, "extraRepos", cfg.ExtraRepos,
+		"upstream", cfg.Upstream, "github", cfg.Sources.GitHub,
 		"passThrough", !cfg.hasSources(), "cacheDir", cfg.CacheDir)
 
 	select {

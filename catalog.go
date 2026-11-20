@@ -67,7 +67,7 @@ func (m *Manifest) validate() error {
 // Entry is one discovered custom plugin.
 type Entry struct {
 	Repo     string   `json:"repo"`
-	Source   string   `json:"source"`   // "org:<name>" or "extra"
+	Source   string   `json:"source"`   // "github:org:<name>", "github:user:<name>" or "github:repo"
 	Manifest Manifest `json:"manifest"` // latest release
 
 	// History holds all stable releases, newest first, including Manifest.
@@ -182,12 +182,28 @@ func (d *Discoverer) loadCache() {
 	slog.Info("loaded cached catalog", "plugins", len(c.Plugins), "updated", c.Updated)
 }
 
+// Source labels, also shown by /_proxy/status.
+const (
+	sourceGitHubRepo = "github:repo"
+	sourceGitHubOrg  = "github:org:"
+	sourceGitHubUser = "github:user:"
+)
+
 func (d *Discoverer) sourceConfigured(e Entry) bool {
-	if e.Source == "extra" {
-		return slices.ContainsFunc(d.cfg.ExtraRepos, func(r string) bool { return strings.EqualFold(r, e.Repo) })
+	gh := &d.cfg.Sources.GitHub
+	in := func(list []string, s string) bool {
+		return slices.ContainsFunc(list, func(x string) bool { return strings.EqualFold(x, s) })
 	}
-	org, ok := strings.CutPrefix(e.Source, "org:")
-	return ok && slices.ContainsFunc(d.cfg.Orgs, func(o string) bool { return strings.EqualFold(o, org) })
+	if e.Source == sourceGitHubRepo {
+		return in(gh.Repos, e.Repo)
+	}
+	if org, ok := strings.CutPrefix(e.Source, sourceGitHubOrg); ok {
+		return in(gh.Orgs, org)
+	}
+	if user, ok := strings.CutPrefix(e.Source, sourceGitHubUser); ok {
+		return in(gh.Users, user)
+	}
+	return false
 }
 
 func (d *Discoverer) saveCache(c *Catalog) {
@@ -237,25 +253,34 @@ func (d *Discoverer) Refresh(ctx context.Context) *Catalog {
 			repos = append(repos, r)
 		}
 	}
-	// Extras first: on a duplicate repo, the explicit config entry wins.
-	for _, r := range d.cfg.ExtraRepos {
-		add(repoRef{r, "extra"})
+	gh := &d.cfg.Sources.GitHub
+	// Explicit repos first: on a duplicate repo, the explicit entry wins.
+	for _, r := range gh.Repos {
+		add(repoRef{r, sourceGitHubRepo})
 	}
-	for _, org := range d.cfg.Orgs {
-		names, err := d.listOrgRepos(ctx, org)
+	type owner struct{ kind, name, source string }
+	var owners []owner
+	for _, o := range gh.Orgs {
+		owners = append(owners, owner{"org", o, sourceGitHubOrg + o})
+	}
+	for _, u := range gh.Users {
+		owners = append(owners, owner{"user", u, sourceGitHubUser + u})
+	}
+	for _, o := range owners {
+		names, err := d.listOwnerRepos(ctx, o.kind, o.name)
 		if err != nil {
-			msg := fmt.Sprintf("org %s: %v (keeping previous plugins)", org, err)
+			msg := fmt.Sprintf("github %s %s: %v (keeping previous plugins)", o.kind, o.name, err)
 			slog.Warn(msg)
 			errs = append(errs, msg)
 			for _, e := range prev.Plugins {
-				if e.Source == "org:"+org {
+				if e.Source == o.source {
 					add(repoRef{e.Repo, e.Source})
 				}
 			}
 			continue
 		}
 		for _, n := range names {
-			add(repoRef{n, "org:" + org})
+			add(repoRef{n, o.source})
 		}
 	}
 
@@ -325,11 +350,11 @@ func (d *Discoverer) Refresh(ctx context.Context) *Catalog {
 	return c
 }
 
-// resolveConflicts enforces unique plugin names. Extra repos beat org repos;
-// two candidates of the same tier are ambiguous and both are dropped.
+// resolveConflicts enforces unique plugin names. Explicit repos beat org and
+// user repos; two candidates of the same tier are ambiguous and both dropped.
 func resolveConflicts(found []Entry) ([]Entry, []string) {
 	tier := func(e Entry) int {
-		if e.Source == "extra" {
+		if e.Source == sourceGitHubRepo {
 			return 0
 		}
 		return 1
@@ -373,10 +398,17 @@ type ghRepo struct {
 	Topics   []string `json:"topics"`
 }
 
-func (d *Discoverer) listOrgRepos(ctx context.Context, org string) ([]string, error) {
+// listOwnerRepos lists the public, non-archived repos of an org or user
+// (kind "org" or "user") that carry at least one configured topic. For users
+// only repos they own are listed, not ones they merely contribute to.
+func (d *Discoverer) listOwnerRepos(ctx context.Context, kind, owner string) ([]string, error) {
+	path := fmt.Sprintf("orgs/%s/repos?type=public", owner)
+	if kind == "user" {
+		path = fmt.Sprintf("users/%s/repos?type=owner", owner)
+	}
 	var names []string
 	for page := 1; page <= 50; page++ {
-		url := fmt.Sprintf("%s/orgs/%s/repos?type=public&per_page=100&page=%d", d.cfg.githubAPI, org, page)
+		url := fmt.Sprintf("%s/%s&per_page=100&page=%d", d.cfg.githubAPI, path, page)
 		body, err := d.getAPI(ctx, url)
 		if err != nil {
 			return nil, err
@@ -386,7 +418,7 @@ func (d *Discoverer) listOrgRepos(ctx context.Context, org string) ([]string, er
 			return nil, fmt.Errorf("decoding repo list: %w", err)
 		}
 		for _, r := range repos {
-			if r.Archived || r.Disabled || r.Private || !slices.Contains(r.Topics, d.cfg.Topic) {
+			if r.Archived || r.Disabled || r.Private || !d.cfg.Sources.GitHub.hasTopic(r.Topics) {
 				continue
 			}
 			names = append(names, r.FullName)
@@ -438,7 +470,7 @@ func (d *Discoverer) getAPI(ctx context.Context, url string) ([]byte, error) {
 		return body, nil
 	case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests:
 		if resp.Header.Get("X-RateLimit-Remaining") == "0" {
-			return nil, fmt.Errorf("GitHub API rate limit exceeded (resets at unix %s); consider githubTokenFile", resp.Header.Get("X-RateLimit-Reset"))
+			return nil, fmt.Errorf("GitHub API rate limit exceeded (resets at unix %s); consider sources.github.tokenFile", resp.Header.Get("X-RateLimit-Reset"))
 		}
 		fallthrough
 	default:

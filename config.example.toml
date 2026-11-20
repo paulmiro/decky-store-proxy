@@ -1,21 +1,23 @@
 # decky-store-proxy configuration.
 # Default location: ~/.config/decky-store-proxy/config.toml
-# An empty file (or no file) makes the proxy a pure pass-through to the
-# official store.
+# Without any GitHub orgs, users or repos (or without a file at all), the
+# proxy is a pure pass-through to the official store.
 
 # listenAddress = "127.0.0.1"
 # port = 8737
-
-# GitHub organizations whose public, non-archived repos with the topic
-# below are offered as plugins.
-orgs = ["paulmiro-decky-store"]
-
-# Individual repos (owner/repo or GitHub URL). They must publish releases
-# in the same format and win over org/upstream plugins of the same name.
-extraRepos = []
-
-# topic = "decky-plugin"
 # refreshInterval = "15m"
 # upstream = "https://plugins.deckbrew.xyz/plugins"   # testing: https://testing.deckbrew.xyz/plugins
-# githubTokenFile = "/path/to/token"   # only needed beyond 60 GitHub API requests/hour
 # cacheDir = "/some/absolute/path"   # default: $CACHE_DIRECTORY (systemd) or ~/.cache/decky-store-proxy
+
+[sources.github]
+# Public, non-archived repos of these orgs/users that have at least one of
+# `topics` are offered.
+orgs = ["paulmiro-decky-store"]
+users = []
+# Always offered (no topic needed). They must publish releases in the same
+# format and win over org/user/upstream plugins of the same name.
+repos = []
+# Default ["decky-plugin"]; must not be empty.
+# topics = ["decky-plugin"]
+# Only needed beyond 60 GitHub API requests/hour. Falls back to $GITHUB_TOKEN.
+# tokenFile = "/path/to/token"

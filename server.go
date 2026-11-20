@@ -409,9 +409,13 @@ func mergeSorted(upstream, custom []map[string]json.RawMessage, sortBy, directio
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	cat := s.disc.Catalog()
 	type plugin struct {
-		Name, Version, Repo, Source, Artifact string
-		Versions                              []string
-		HistoryComplete                       bool
+		Name            string   `json:"name"`
+		Version         string   `json:"version"`
+		Versions        []string `json:"versions"`
+		HistoryComplete bool     `json:"historyComplete"`
+		Repo            string   `json:"repo"`
+		Source          string   `json:"source"`
+		Artifact        string   `json:"artifact"`
 	}
 	ps := []plugin{}
 	for _, e := range cat.Plugins {
@@ -419,19 +423,39 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		for _, v := range e.versions() {
 			vs = append(vs, v.Version)
 		}
-		ps = append(ps, plugin{e.Manifest.Name, e.Manifest.Version, e.Repo, e.Source, e.Manifest.Artifact, vs, e.HistoryComplete})
+		ps = append(ps, plugin{e.Manifest.Name, e.Manifest.Version, vs, e.HistoryComplete, e.Repo, e.Source, e.Manifest.Artifact})
+	}
+	nonNil := func(l []string) []string {
+		if l == nil {
+			return []string{}
+		}
+		return l
+	}
+	gh := s.cfg.Sources.GitHub
+	var updated any
+	if !cat.Updated.IsZero() {
+		updated = cat.Updated
 	}
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
 	enc.Encode(map[string]any{
+		"version":     version,
 		"upstream":    s.cfg.Upstream,
-		"orgs":        s.cfg.Orgs,
-		"extraRepos":  s.cfg.ExtraRepos,
 		"passThrough": cat.empty(),
-		"updated":     cat.Updated,
-		"plugins":     ps,
-		"errors":      cat.Errors,
+		"sources": map[string]any{
+			"github": map[string]any{
+				"orgs":          nonNil(gh.Orgs),
+				"users":         nonNil(gh.Users),
+				"repos":         nonNil(gh.Repos),
+				"topics":        nonNil(gh.Topics),
+				"authenticated": s.cfg.githubToken != "",
+			},
+		},
+		"refreshInterval": s.cfg.RefreshInterval.String(),
+		"updated":         updated,
+		"plugins":         ps,
+		"errors":          nonNil(cat.Errors),
 	})
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(buf.Bytes())

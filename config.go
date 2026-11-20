@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,18 +27,42 @@ type Config struct {
 	ListenAddress   string   `toml:"listenAddress"`
 	Port            int      `toml:"port"`
 	Upstream        string   `toml:"upstream"`
-	Orgs            []string `toml:"orgs"`
-	ExtraRepos      []string `toml:"extraRepos"`
-	Topic           string   `toml:"topic"`
 	RefreshInterval Duration `toml:"refreshInterval"`
-	GithubTokenFile string   `toml:"githubTokenFile"`
 	CacheDir        string   `toml:"cacheDir"`
+	Sources         Sources  `toml:"sources"`
 
 	// Not configurable from TOML; overridden in tests.
 	githubAPI string
 	githubWeb string
-	// Resolved from GithubTokenFile / $GITHUB_TOKEN.
+	// Resolved from Sources.GitHub.TokenFile / $GITHUB_TOKEN.
 	githubToken string
+}
+
+// Sources lists where custom plugins come from. Each kind of source gets its
+// own table, so more kinds can be added later.
+type Sources struct {
+	GitHub GitHubSource `toml:"github"`
+}
+
+// GitHubSource is the [sources.github] table.
+type GitHubSource struct {
+	// Owners whose public, non-archived repos with one of Topics are scanned.
+	Orgs  []string `toml:"orgs" json:"orgs"`
+	Users []string `toml:"users" json:"users"`
+	// Repos are always included (no topic required) and win name conflicts.
+	Repos []string `toml:"repos" json:"repos"`
+	// Topics filters org/user repos: a repo needs at least one of them.
+	// Omitted means ["decky-plugin"]; an explicit empty list is an error.
+	Topics    []string `toml:"topics" json:"topics"`
+	TokenFile string   `toml:"tokenFile" json:"-"`
+}
+
+func (g *GitHubSource) configured() bool {
+	return len(g.Orgs) > 0 || len(g.Users) > 0 || len(g.Repos) > 0
+}
+
+func (g *GitHubSource) hasTopic(topics []string) bool {
+	return slices.ContainsFunc(topics, func(t string) bool { return slices.Contains(g.Topics, t) })
 }
 
 // Duration accepts Go duration strings such as "15m" or "1h".
@@ -53,14 +78,15 @@ func (d *Duration) UnmarshalText(b []byte) error {
 }
 
 var (
-	orgNameRe  = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
-	repoNameRe = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$`)
+	ownerNameRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$`)
+	topicRe     = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,49}$`)
+	repoNameRe  = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$`)
 )
 
 // hasSources reports whether anything besides the upstream store is configured.
 // Without sources the proxy is a pure pass-through.
 func (c *Config) hasSources() bool {
-	return len(c.Orgs) > 0 || len(c.ExtraRepos) > 0
+	return c.Sources.GitHub.configured()
 }
 
 func (c *Config) addr() string {
@@ -121,26 +147,14 @@ func (c *Config) finalize() error {
 	if !strings.HasPrefix(c.Upstream, "https://") && !strings.HasPrefix(c.Upstream, "http://") {
 		return fmt.Errorf("upstream %q must be an http(s) URL", c.Upstream)
 	}
-	if c.Topic == "" {
-		c.Topic = defaultTopic
-	}
 	if c.RefreshInterval.Duration == 0 {
 		c.RefreshInterval.Duration = defaultRefreshInterval
 	}
 	if c.RefreshInterval.Duration < time.Minute {
 		return fmt.Errorf("refreshInterval must be at least 1m")
 	}
-	for _, o := range c.Orgs {
-		if !orgNameRe.MatchString(o) {
-			return fmt.Errorf("invalid org name %q", o)
-		}
-	}
-	for i, r := range c.ExtraRepos {
-		n, err := normalizeRepo(r)
-		if err != nil {
-			return err
-		}
-		c.ExtraRepos[i] = n
+	if err := c.Sources.GitHub.finalize(); err != nil {
+		return fmt.Errorf("sources.github: %w", err)
 	}
 	if c.CacheDir == "" {
 		if d := os.Getenv("CACHE_DIRECTORY"); d != "" { // set by systemd's CacheDirectory=
@@ -149,10 +163,10 @@ func (c *Config) finalize() error {
 			c.CacheDir = filepath.Join(d, "decky-store-proxy")
 		}
 	}
-	if c.GithubTokenFile != "" {
-		b, err := os.ReadFile(c.GithubTokenFile)
+	if tf := c.Sources.GitHub.TokenFile; tf != "" {
+		b, err := os.ReadFile(tf)
 		if err != nil {
-			return fmt.Errorf("reading githubTokenFile: %w", err)
+			return fmt.Errorf("reading sources.github.tokenFile: %w", err)
 		}
 		c.githubToken = strings.TrimSpace(string(b))
 	} else {
@@ -167,6 +181,38 @@ func (c *Config) finalize() error {
 	return nil
 }
 
+func (g *GitHubSource) finalize() error {
+	for _, list := range []struct {
+		key   string
+		names []string
+	}{{"orgs", g.Orgs}, {"users", g.Users}} {
+		for _, n := range list.names {
+			if !ownerNameRe.MatchString(n) {
+				return fmt.Errorf("invalid %s entry %q", list.key, n)
+			}
+		}
+	}
+	for i, r := range g.Repos {
+		n, err := normalizeRepo(r)
+		if err != nil {
+			return err
+		}
+		g.Repos[i] = n
+	}
+	switch {
+	case g.Topics == nil:
+		g.Topics = []string{defaultTopic}
+	case len(g.Topics) == 0:
+		return fmt.Errorf("topics must not be empty (omit it to use [%q])", defaultTopic)
+	}
+	for _, t := range g.Topics {
+		if !topicRe.MatchString(t) {
+			return fmt.Errorf("invalid topic %q (lowercase letters, digits and hyphens)", t)
+		}
+	}
+	return nil
+}
+
 // normalizeRepo accepts "owner/repo", "github.com/owner/repo" or
 // "https://github.com/owner/repo(.git)" and returns "owner/repo".
 func normalizeRepo(s string) (string, error) {
@@ -177,7 +223,7 @@ func normalizeRepo(s string) (string, error) {
 	r = strings.TrimSuffix(r, "/")
 	r = strings.TrimSuffix(r, ".git")
 	if !repoNameRe.MatchString(r) {
-		return "", fmt.Errorf("invalid extraRepos entry %q (expected owner/repo or a github.com URL)", s)
+		return "", fmt.Errorf("invalid repos entry %q (expected owner/repo or a github.com URL)", s)
 	}
 	return r, nil
 }

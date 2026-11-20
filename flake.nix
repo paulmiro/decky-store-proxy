@@ -52,10 +52,13 @@
                   services.decky-store-proxy = {
                     enable = true;
                     settings = {
-                      orgs = [ "example-org" ];
-                      extraRepos = [ "someone/some-plugin" ];
                       refreshInterval = "30m";
-                      githubTokenFile = "/run/secrets/github-token";
+                      sources.github = {
+                        orgs = [ "example-org" ];
+                        users = [ "example-user" ];
+                        repos = [ "someone/some-plugin" ];
+                        tokenFile = "/run/secrets/github-token";
+                      };
                     };
                   };
                 }

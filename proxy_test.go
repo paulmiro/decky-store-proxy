@@ -94,9 +94,10 @@ func newFakeUpstream(t *testing.T) *fakeUpstream {
 type fakeGitHub struct {
 	*httptest.Server
 	mu        sync.Mutex
-	repos     []ghRepo
-	manifests map[string]string // repo -> body; missing = 404
-	failing   map[string]bool   // repo -> 500
+	repos     []ghRepo            // org listing
+	userRepos map[string][]ghRepo // user -> repos
+	manifests map[string]string   // repo -> body; missing = 404
+	failing   map[string]bool     // repo -> 500
 	releases  map[string][]fakeRelease
 	apiCalls  int // org listing
 	relCalls  int // release listing
@@ -110,7 +111,7 @@ type fakeRelease struct {
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
-	g := &fakeGitHub{manifests: map[string]string{}, failing: map[string]bool{}, releases: map[string][]fakeRelease{}}
+	g := &fakeGitHub{manifests: map[string]string{}, failing: map[string]bool{}, releases: map[string][]fakeRelease{}, userRepos: map[string][]ghRepo{}}
 	g.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		defer g.mu.Unlock()
@@ -126,6 +127,14 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 			}
 			w.Header().Set("ETag", `"v1"`)
 			json.NewEncoder(w).Encode(g.repos)
+			return
+		}
+		if rest, ok := strings.CutPrefix(r.URL.Path, "/api/users/"); ok {
+			if r.URL.Query().Get("type") != "owner" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			json.NewEncoder(w).Encode(g.userRepos[strings.TrimSuffix(rest, "/repos")])
 			return
 		}
 		if rest, ok := strings.CutPrefix(r.URL.Path, "/api/repos/"); ok {
@@ -331,7 +340,7 @@ func setupOrg(h *harness) {
 }
 
 func TestDiscoveryAndMerge(t *testing.T) {
-	h := newHarness(t, func(c *Config) { c.Orgs = []string{"org"} })
+	h := newHarness(t, func(c *Config) { c.Sources.GitHub.Orgs = []string{"org"} })
 	setupOrg(h)
 	cat := h.disc.Refresh(context.Background())
 
@@ -406,7 +415,7 @@ func TestDiscoveryAndMerge(t *testing.T) {
 }
 
 func TestTransientFailuresKeepPreviousData(t *testing.T) {
-	h := newHarness(t, func(c *Config) { c.Orgs = []string{"org"} })
+	h := newHarness(t, func(c *Config) { c.Sources.GitHub.Orgs = []string{"org"} })
 	setupOrg(h)
 	h.disc.Refresh(context.Background())
 
@@ -436,7 +445,7 @@ func TestTransientFailuresKeepPreviousData(t *testing.T) {
 }
 
 func TestCacheSurvivesRestart(t *testing.T) {
-	h := newHarness(t, func(c *Config) { c.Orgs = []string{"org"} })
+	h := newHarness(t, func(c *Config) { c.Sources.GitHub.Orgs = []string{"org"} })
 	setupOrg(h)
 	h.disc.Refresh(context.Background())
 
@@ -448,8 +457,7 @@ func TestCacheSurvivesRestart(t *testing.T) {
 
 	// Removing the org from config drops its cached plugins.
 	cfg := *h.cfg
-	cfg.Orgs = nil
-	cfg.ExtraRepos = []string{"someone/else"}
+	cfg.Sources.GitHub = GitHubSource{Repos: []string{"someone/else"}, Topics: []string{"decky-plugin"}}
 	d3 := newDiscoverer(&cfg, &http.Client{})
 	d3.loadCache()
 	if !d3.Catalog().empty() {
@@ -459,8 +467,8 @@ func TestCacheSurvivesRestart(t *testing.T) {
 
 func TestConflicts(t *testing.T) {
 	h := newHarness(t, func(c *Config) {
-		c.Orgs = []string{"org"}
-		c.ExtraRepos = []string{"https://github.com/someone/fork.git"}
+		c.Sources.GitHub.Orgs = []string{"org"}
+		c.Sources.GitHub.Repos = []string{"https://github.com/someone/fork.git"}
 	})
 	h.gh.repos = []ghRepo{
 		{FullName: "org/a1", Topics: []string{"decky-plugin"}},
@@ -477,7 +485,7 @@ func TestConflicts(t *testing.T) {
 		t.Error("ambiguous name not dropped")
 	}
 	if e := cat.lookup("Forked"); e == nil || e.Repo != "someone/fork" {
-		t.Errorf("extra repo should win: %+v", e)
+		t.Errorf("explicit repo should win: %+v", e)
 	}
 }
 
@@ -487,23 +495,46 @@ func TestConfig(t *testing.T) {
 
 	os.WriteFile(p, []byte(""), 0o644)
 	c, err := loadConfig(p)
-	if err != nil || c.Port != 8737 || c.ListenAddress != "127.0.0.1" || c.hasSources() || c.Upstream != defaultUpstream {
+	if err != nil || c.Port != 8737 || c.ListenAddress != "127.0.0.1" || c.hasSources() || c.Upstream != defaultUpstream ||
+		fmt.Sprint(c.Sources.GitHub.Topics) != "[decky-plugin]" {
 		t.Fatalf("empty config: %+v %v", c, err)
 	}
 
+	tok := filepath.Join(dir, "token")
+	os.WriteFile(tok, []byte("secret\n"), 0o600)
 	os.WriteFile(p, []byte(`
 port = 9000
 listenAddress = "::1"
-orgs = ["my-org"]
-extraRepos = ["https://github.com/a/b/", "c/d.e"]
 refreshInterval = "1h"
+
+[sources.github]
+orgs = ["my-org"]
+users = ["some-user"]
+repos = ["https://github.com/a/b/", "c/d.e"]
+topics = ["decky-plugin", "my-store"]
+tokenFile = "`+tok+`"
 `), 0o644)
 	c, err = loadConfig(p)
-	if err != nil || c.addr() != "[::1]:9000" || fmt.Sprint(c.ExtraRepos) != "[a/b c/d.e]" || c.RefreshInterval.Hours() != 1 {
+	gh := c.Sources.GitHub
+	if err != nil || c.addr() != "[::1]:9000" || fmt.Sprint(gh.Repos) != "[a/b c/d.e]" || c.RefreshInterval.Hours() != 1 ||
+		fmt.Sprint(gh.Users) != "[some-user]" || fmt.Sprint(gh.Topics) != "[decky-plugin my-store]" || c.githubToken != "secret" || !c.hasSources() {
 		t.Fatalf("%+v %v", c, err)
 	}
 
-	for _, bad := range []string{`prot = 1`, `extraRepos = ["nope"]`, `orgs = ["a/b"]`, `refreshInterval = "5s"`} {
+	for _, bad := range []string{
+		`prot = 1`,
+		`orgs = ["a"]`, // old top-level format is not accepted
+		`extraRepos = ["a/b"]`,
+		`githubTokenFile = "/x"`,
+		"[sources.github]\nrepos = [\"nope\"]",
+		"[sources.github]\norgs = [\"a/b\"]",
+		"[sources.github]\nusers = [\"-bad\"]",
+		"[sources.github]\ntopics = []",
+		"[sources.github]\ntopics = [\"Upper\"]",
+		"[sources.github]\nfoo = 1",
+		"[sources.gitlab]\nrepos = [\"a/b\"]",
+		`refreshInterval = "5s"`,
+	} {
 		os.WriteFile(p, []byte(bad), 0o644)
 		if _, err := loadConfig(p); err == nil {
 			t.Errorf("accepted %q", bad)
@@ -511,6 +542,59 @@ refreshInterval = "1h"
 	}
 	if _, err := loadConfig(filepath.Join(dir, "missing.toml")); err == nil {
 		t.Error("explicit missing config accepted")
+	}
+}
+
+func TestUsersAndTopics(t *testing.T) {
+	h := newHarness(t, func(c *Config) {
+		c.Sources.GitHub.Users = []string{"alice"}
+		c.Sources.GitHub.Repos = []string{"bob/untagged"}
+		c.Sources.GitHub.Topics = []string{"decky-plugin", "my-store"}
+	})
+	h.gh.userRepos["alice"] = []ghRepo{
+		{FullName: "alice/one", Topics: []string{"decky-plugin"}},
+		{FullName: "alice/two", Topics: []string{"my-store", "other"}},
+		{FullName: "alice/none", Topics: []string{"other"}},
+		{FullName: "alice/old", Topics: []string{"decky-plugin"}, Archived: true},
+	}
+	h.gh.manifests["alice/one"] = manifest("One", "1.0.0", "alice/one", "")
+	h.gh.manifests["alice/two"] = manifest("Two", "1.0.0", "alice/two", "")
+	h.gh.manifests["alice/none"] = manifest("None", "1.0.0", "alice/none", "")
+	h.gh.manifests["alice/old"] = manifest("Old", "1.0.0", "alice/old", "")
+	h.gh.manifests["bob/untagged"] = manifest("Bob", "1.0.0", "bob/untagged", "")
+	cat := h.disc.Refresh(context.Background())
+
+	var got []string
+	for _, e := range cat.Plugins {
+		got = append(got, e.Manifest.Name+"="+e.Source)
+	}
+	if fmt.Sprint(got) != "[Bob=github:repo One=github:user:alice Two=github:user:alice]" {
+		t.Fatalf("got %v, errors %v", got, cat.Errors)
+	}
+
+	resp, body := h.do(t, "GET", "/_proxy/status", nil)
+	var st struct {
+		PassThrough bool `json:"passThrough"`
+		Sources     struct {
+			GitHub struct {
+				Orgs, Users, Repos, Topics []string
+				Authenticated              bool
+			} `json:"github"`
+		} `json:"sources"`
+		Plugins []struct {
+			Name, Version, Repo, Source string
+			Versions                    []string
+		} `json:"plugins"`
+		Errors []string `json:"errors"`
+	}
+	if err := json.Unmarshal([]byte(body), &st); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("status: %v %s", err, body)
+	}
+	gh := st.Sources.GitHub
+	if st.PassThrough || fmt.Sprint(gh.Users) != "[alice]" || gh.Orgs == nil || len(gh.Orgs) != 0 ||
+		fmt.Sprint(gh.Repos) != "[bob/untagged]" || gh.Authenticated || len(st.Plugins) != 3 ||
+		st.Plugins[1].Source != "github:user:alice" || fmt.Sprint(st.Plugins[1].Versions) != "[1.0.0]" || st.Errors == nil {
+		t.Fatalf("status = %s", body)
 	}
 }
 
@@ -540,7 +624,7 @@ func TestManifestValidation(t *testing.T) {
 // Regression: Decky labels an update "downgrade" if the installed version is
 // missing from the store's versions list, so all releases must be listed.
 func TestReleaseHistory(t *testing.T) {
-	h := newHarness(t, func(c *Config) { c.ExtraRepos = []string{"o/p"} })
+	h := newHarness(t, func(c *Config) { c.Sources.GitHub.Repos = []string{"o/p"} })
 	m010 := manifest("P", "0.1.0", "o/p", "2026-01-01T00:00:00Z")
 	m011 := manifest("P", "0.1.1", "o/p", "2026-02-01T00:00:00Z")
 	m012 := manifest("P", "0.1.2", "o/p", "2026-03-01T00:00:00Z")
