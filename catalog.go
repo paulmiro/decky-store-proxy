@@ -20,15 +20,23 @@ import (
 )
 
 const (
-	manifestAsset  = "decky-store.json"
-	manifestSchema = 1
-	maxManifest    = 64 << 10
-	fetchWorkers   = 8
+	manifestAsset   = "decky-store.json"
+	manifestSchema  = 2
+	maxManifest     = 64 << 10
+	fetchWorkers    = 8
+	releasesPerPage = 100
+	maxReleasePages = 50
 )
 
-// Manifest is the decky-store.json asset attached to every plugin release.
+// Manifest is the decky-store.json asset of a release. It lists every Decky
+// plugin built in that release.
 type Manifest struct {
-	Schema      int       `json:"schema"`
+	Schema  int      `json:"schema"`
+	Plugins []Plugin `json:"plugins"`
+}
+
+// Plugin is one plugin version in a manifest.
+type Plugin struct {
 	Name        string    `json:"name"`
 	Version     string    `json:"version"`
 	Artifact    string    `json:"artifact"`
@@ -47,42 +55,61 @@ var (
 )
 
 func (m *Manifest) validate() error {
-	switch {
-	case m.Schema != manifestSchema:
+	if m.Schema != manifestSchema {
 		return fmt.Errorf("unsupported schema %d", m.Schema)
-	case strings.TrimSpace(m.Name) == "" || strings.ContainsAny(m.Name, "/\\"):
-		return fmt.Errorf("invalid name %q", m.Name)
-	case !semverRe.MatchString(m.Version):
-		return fmt.Errorf("version %q is not semver", m.Version)
-	case !sha256Re.MatchString(m.SHA256):
-		return fmt.Errorf("sha256 %q is not a lowercase hex sha256", m.SHA256)
-	case !strings.HasPrefix(m.Artifact, "https://github.com/") || !strings.Contains(m.Artifact, "/releases/download/"):
-		return fmt.Errorf("artifact %q is not a GitHub release download URL", m.Artifact)
-	case m.ImageURL != "" && !strings.HasPrefix(m.ImageURL, "https://"):
-		return fmt.Errorf("image_url %q is not https", m.ImageURL)
+	}
+	if len(m.Plugins) == 0 {
+		return errors.New("no plugins")
+	}
+	names := map[string]bool{}
+	for i := range m.Plugins {
+		p := &m.Plugins[i]
+		if err := p.validate(); err != nil {
+			return fmt.Errorf("plugin %d: %w", i, err)
+		}
+		if names[p.Name] {
+			return fmt.Errorf("plugin name %q listed twice", p.Name)
+		}
+		names[p.Name] = true
+	}
+	return nil
+}
+
+func (p *Plugin) validate() error {
+	switch {
+	case strings.TrimSpace(p.Name) == "" || strings.ContainsAny(p.Name, "/\\"):
+		return fmt.Errorf("invalid name %q", p.Name)
+	case !semverRe.MatchString(p.Version):
+		return fmt.Errorf("version %q is not semver", p.Version)
+	case !sha256Re.MatchString(p.SHA256):
+		return fmt.Errorf("sha256 %q is not a lowercase hex sha256", p.SHA256)
+	case !strings.HasPrefix(p.Artifact, "https://github.com/") || !strings.Contains(p.Artifact, "/releases/download/"):
+		return fmt.Errorf("artifact %q is not a GitHub release download URL", p.Artifact)
+	case p.ImageURL != "" && !strings.HasPrefix(p.ImageURL, "https://"):
+		return fmt.Errorf("image_url %q is not https", p.ImageURL)
 	}
 	return nil
 }
 
 // Entry is one discovered custom plugin.
 type Entry struct {
-	Repo     string   `json:"repo"`
-	Source   string   `json:"source"`   // "github:org:<name>", "github:user:<name>" or "github:repo"
-	Manifest Manifest `json:"manifest"` // latest release
+	Repo   string `json:"repo"`
+	Source string `json:"source"` // "github:org:<name>", "github:user:<name>" or "github:repo"
+	Latest Plugin `json:"latest"` // from the repo's latest release
 
-	// History holds all stable releases, newest first, including Manifest.
-	// Decky's store card needs the installed version in this list, or it
-	// labels the update as a "downgrade".
-	History []Manifest `json:"history,omitempty"`
+	// History holds every known stable version, newest first, including
+	// Latest. Decky's store card needs the installed version in this list, or
+	// it labels the update as a "downgrade".
+	History []Plugin `json:"history"`
 	// HistoryComplete is false if the release list couldn't be fetched; it is
 	// retried on the next refresh.
-	HistoryComplete bool `json:"historyComplete,omitempty"`
+	HistoryComplete bool `json:"historyComplete"`
 }
 
 // versions returns all known versions, newest first.
-func (e *Entry) versions() []Manifest {
+func (e *Entry) versions() []Plugin {
 	if len(e.History) == 0 {
-		return []Manifest{e.Manifest}
+		return []Plugin{e.Latest}
 	}
 	return e.History
 }
@@ -90,23 +117,104 @@ func (e *Entry) versions() []Manifest {
 // id returns a stable negative id so it can never collide with upstream ids.
 func (e *Entry) id() int64 {
 	h := fnv.New32a()
-	h.Write([]byte(strings.ToLower(e.Repo)))
+	h.Write([]byte(strings.ToLower(e.Repo) + "\x00" + e.Latest.Name))
 	return -int64(h.Sum32()&0x7fffffff) - 1
 }
 
-// Catalog is the result of one refresh. It is immutable once published.
+// repoState is everything known about one repo. Entries are derived from it.
+type repoState struct {
+	Repo   string   `json:"repo"`
+	Source string   `json:"source"`
+	Latest []Plugin `json:"latest"` // manifest of the latest release
+
+	// Releases are the stable releases with a decky-store.json, newest first.
+	Releases []releaseRecord `json:"releases,omitempty"`
+	// Complete: Releases reached the end of the release list once, so later
+	// fetches only need the newest page(s).
+	Complete bool `json:"complete,omitempty"`
+	// Stale: the last fetch of the release list failed; retried next refresh.
+	Stale bool `json:"stale,omitempty"`
+}
+
+// releaseRecord caches one release's manifest. A manifest is downloaded once
+// per asset id; a re-uploaded asset gets a new id and is downloaded again.
+type releaseRecord struct {
+	ID      int64    `json:"id"`
+	Tag     string   `json:"tag"`
+	Asset   int64    `json:"asset"`
+	Plugins []Plugin `json:"plugins,omitempty"`
+	Invalid string   `json:"invalid,omitempty"`
+}
+
+// entries derives one Entry per plugin of the latest release. Older versions
+// come from older releases' manifests, matched by plugin name. If several
+// releases contain the same version, the newest release's copy is used, with
+// the creation time of the oldest.
+func (s *repoState) entries() []Entry {
+	var out []Entry
+	for _, latest := range s.Latest {
+		byVersion := map[string]int{latest.Version: 0}
+		hist := []Plugin{latest}
+		for _, rec := range s.Releases {
+			for _, p := range rec.Plugins {
+				if p.Name != latest.Name || compareSemver(p.Version, latest.Version) > 0 {
+					continue
+				}
+				i, ok := byVersion[p.Version]
+				if !ok {
+					byVersion[p.Version] = len(hist)
+					hist = append(hist, p)
+					continue
+				}
+				if !p.Created.IsZero() && (hist[i].Created.IsZero() || p.Created.Before(hist[i].Created)) {
+					hist[i].Created = p.Created
+				}
+			}
+		}
+		slices.SortStableFunc(hist, func(a, b Plugin) int { return compareSemver(b.Version, a.Version) })
+		out = append(out, Entry{
+			Repo:            s.Repo,
+			Source:          s.Source,
+			Latest:          hist[slices.IndexFunc(hist, func(p Plugin) bool { return p.Version == latest.Version })],
+			History:         hist,
+			HistoryComplete: s.Complete && !s.Stale,
+		})
+	}
+	return out
+}
+
+// cacheVersion is bumped whenever the cache format changes; other versions
+// are ignored.
+const cacheVersion = 2
+
+// Catalog is the result of one refresh. It is immutable once published. Only
+// Repos is saved to the cache; Plugins is derived from it.
 type Catalog struct {
-	Updated time.Time `json:"updated"`
-	Plugins []Entry   `json:"plugins"`
-	Errors  []string  `json:"errors,omitempty"`
+	Version int                   `json:"version"`
+	Updated time.Time             `json:"updated"`
+	Errors  []string              `json:"errors,omitempty"`
+	Repos   map[string]*repoState `json:"repos"` // key: lowercase owner/repo
+	Plugins []Entry               `json:"-"`
 
 	byName map[string]*Entry
+}
+
+// newCatalog derives the plugin list from repos.
+func newCatalog(updated time.Time, repos map[string]*repoState, errs []string) (*Catalog, []string) {
+	var found []Entry
+	for _, st := range repos {
+		found = append(found, st.entries()...)
+	}
+	plugins, conflictErrs := resolveConflicts(found)
+	c := &Catalog{Version: cacheVersion, Updated: updated, Errors: append(errs, conflictErrs...), Repos: repos, Plugins: plugins}
+	c.index()
+	return c, conflictErrs
 }
 
 func (c *Catalog) index() {
 	c.byName = make(map[string]*Entry, len(c.Plugins))
 	for i := range c.Plugins {
-		c.byName[c.Plugins[i].Manifest.Name] = &c.Plugins[i]
+		c.byName[c.Plugins[i].Latest.Name] = &c.Plugins[i]
 	}
 }
 
@@ -137,8 +245,7 @@ type cachedResponse struct {
 
 func newDiscoverer(cfg *Config, client *http.Client) *Discoverer {
 	d := &Discoverer{cfg: cfg, client: client, etags: map[string]cachedResponse{}}
-	d.current = &Catalog{}
-	d.current.index()
+	d.current, _ = newCatalog(time.Time{}, map[string]*repoState{}, nil)
 	return d
 }
 
@@ -168,16 +275,25 @@ func (d *Discoverer) loadCache() {
 		}
 		return
 	}
-	var c Catalog
-	if err := json.Unmarshal(b, &c); err != nil {
+	var saved Catalog
+	if err := json.Unmarshal(b, &saved); err != nil {
 		slog.Warn("ignoring corrupt cache", "path", p, "err", err)
 		return
 	}
-	// Drop cached plugins whose source is no longer configured.
-	c.Plugins = slices.DeleteFunc(c.Plugins, func(e Entry) bool { return !d.sourceConfigured(e) })
-	c.index()
+	if saved.Version != cacheVersion {
+		slog.Info("ignoring cache from another version", "path", p)
+		return
+	}
+	// Drop cached repos whose source is no longer configured.
+	repos := map[string]*repoState{}
+	for k, st := range saved.Repos {
+		if st != nil && d.sourceConfigured(st.Repo, st.Source) {
+			repos[k] = st
+		}
+	}
+	c, _ := newCatalog(saved.Updated, repos, saved.Errors)
 	d.mu.Lock()
-	d.current = &c
+	d.current = c
 	d.mu.Unlock()
 	slog.Info("loaded cached catalog", "plugins", len(c.Plugins), "updated", c.Updated)
 }
@@ -189,18 +305,18 @@ const (
 	sourceGitHubUser = "github:user:"
 )
 
-func (d *Discoverer) sourceConfigured(e Entry) bool {
+func (d *Discoverer) sourceConfigured(repo, source string) bool {
 	gh := &d.cfg.Sources.GitHub
 	in := func(list []string, s string) bool {
 		return slices.ContainsFunc(list, func(x string) bool { return strings.EqualFold(x, s) })
 	}
-	if e.Source == sourceGitHubRepo {
-		return in(gh.Repos, e.Repo)
+	if source == sourceGitHubRepo {
+		return in(gh.Repos, repo)
 	}
-	if org, ok := strings.CutPrefix(e.Source, sourceGitHubOrg); ok {
+	if org, ok := strings.CutPrefix(source, sourceGitHubOrg); ok {
 		return in(gh.Orgs, org)
 	}
-	if user, ok := strings.CutPrefix(e.Source, sourceGitHubUser); ok {
+	if user, ok := strings.CutPrefix(source, sourceGitHubUser); ok {
 		return in(gh.Users, user)
 	}
 	return false
@@ -238,10 +354,6 @@ func (d *Discoverer) Refresh(ctx context.Context) *Catalog {
 	defer d.refresh.Unlock()
 
 	prev := d.Catalog()
-	prevByRepo := map[string]Entry{}
-	for _, e := range prev.Plugins {
-		prevByRepo[strings.ToLower(e.Repo)] = e
-	}
 
 	var errs []string
 	var repos []repoRef
@@ -272,9 +384,9 @@ func (d *Discoverer) Refresh(ctx context.Context) *Catalog {
 			msg := fmt.Sprintf("github %s %s: %v (keeping previous plugins)", o.kind, o.name, err)
 			slog.Warn(msg)
 			errs = append(errs, msg)
-			for _, e := range prev.Plugins {
-				if e.Source == o.source {
-					add(repoRef{e.Repo, e.Source})
+			for _, st := range prev.Repos {
+				if st.Source == o.source {
+					add(repoRef{st.Repo, st.Source})
 				}
 			}
 			continue
@@ -285,7 +397,7 @@ func (d *Discoverer) Refresh(ctx context.Context) *Catalog {
 	}
 
 	type result struct {
-		entry *Entry
+		state *repoState
 		err   string
 	}
 	results := make([]result, len(repos))
@@ -297,56 +409,30 @@ func (d *Discoverer) Refresh(ctx context.Context) *Catalog {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			m, err := d.fetchManifest(ctx, r.name)
-			switch {
-			case err == nil:
-				prev, hasPrev := prevByRepo[strings.ToLower(r.name)]
-				e, histErr := d.withHistory(ctx, Entry{Repo: r.name, Source: r.source, Manifest: *m}, prev, hasPrev)
-				results[i].entry = &e
-				if histErr != nil {
-					results[i].err = fmt.Sprintf("%s: release history: %v (will retry)", r.name, histErr)
-				}
-			case errors.Is(err, errNoRelease):
-				results[i].err = fmt.Sprintf("%s: no release with %s", r.name, manifestAsset)
-			case errors.Is(err, errInvalid):
-				results[i].err = fmt.Sprintf("%s: %v", r.name, err)
-			default:
-				if p, ok := prevByRepo[strings.ToLower(r.name)]; ok {
-					p.Source = r.source
-					results[i].entry = &p
-					results[i].err = fmt.Sprintf("%s: %v (keeping previous version %s)", r.name, err, p.Manifest.Version)
-				} else {
-					results[i].err = fmt.Sprintf("%s: %v", r.name, err)
-				}
-			}
+			results[i].state, results[i].err = d.refreshRepo(ctx, r, prev.Repos[strings.ToLower(r.name)])
 		}()
 	}
 	wg.Wait()
 
-	var found []Entry
+	states := map[string]*repoState{}
 	for _, r := range results {
 		if r.err != "" {
 			slog.Warn(r.err)
 			errs = append(errs, r.err)
 		}
-		if r.entry != nil {
-			found = append(found, *r.entry)
+		if r.state != nil {
+			states[strings.ToLower(r.state.Repo)] = r.state
 		}
 	}
-
-	plugins, conflictErrs := resolveConflicts(found)
+	c, conflictErrs := newCatalog(time.Now().UTC(), states, errs)
 	for _, e := range conflictErrs {
 		slog.Warn(e)
 	}
-	errs = append(errs, conflictErrs...)
-
-	c := &Catalog{Updated: time.Now().UTC(), Plugins: plugins, Errors: errs}
-	c.index()
 	d.mu.Lock()
 	d.current = c
 	d.mu.Unlock()
 	d.saveCache(c)
-	slog.Info("refreshed catalog", "plugins", len(plugins), "errors", len(errs))
+	slog.Info("refreshed catalog", "plugins", len(c.Plugins), "errors", len(c.Errors))
 	return c
 }
 
@@ -361,7 +447,7 @@ func resolveConflicts(found []Entry) ([]Entry, []string) {
 	}
 	groups := map[string][]Entry{}
 	for _, e := range found {
-		groups[e.Manifest.Name] = append(groups[e.Manifest.Name], e)
+		groups[e.Latest.Name] = append(groups[e.Latest.Name], e)
 	}
 	var out []Entry
 	var errs []string
@@ -380,7 +466,7 @@ func resolveConflicts(found []Entry) ([]Entry, []string) {
 		}
 		out = append(out, best)
 	}
-	slices.SortFunc(out, func(a, b Entry) int { return strings.Compare(a.Manifest.Name, b.Manifest.Name) })
+	slices.SortFunc(out, func(a, b Entry) int { return strings.Compare(a.Latest.Name, b.Latest.Name) })
 	slices.Sort(errs)
 	return out, errs
 }
@@ -482,96 +568,145 @@ func (d *Discoverer) fetchManifest(ctx context.Context, repo string) (*Manifest,
 	return d.fetchManifestURL(ctx, fmt.Sprintf("%s/%s/releases/latest/download/%s", d.cfg.githubWeb, repo, manifestAsset))
 }
 
-// withHistory fills e.History. The releases API is only called when the
-// latest release changed (or the history is incomplete), so a steady state
-// costs no API requests per repo.
-func (d *Discoverer) withHistory(ctx context.Context, e Entry, prev Entry, hasPrev bool) (Entry, error) {
-	var known []Manifest
-	if hasPrev && prev.Manifest.Name == e.Manifest.Name {
-		known = prev.versions()
-		if prev.HistoryComplete && prev.Manifest.Version == e.Manifest.Version && prev.Manifest.SHA256 == e.Manifest.SHA256 {
-			e.History, e.HistoryComplete = prev.History, true
-			return e, nil
+// refreshRepo checks one repo's latest release. prev is its state from the
+// last refresh, or nil. A nil state means the repo offers no plugins.
+func (d *Discoverer) refreshRepo(ctx context.Context, r repoRef, prev *repoState) (*repoState, string) {
+	m, err := d.fetchManifest(ctx, r.name)
+	switch {
+	case errors.Is(err, errNoRelease):
+		return nil, fmt.Sprintf("%s: latest release has no %s", r.name, manifestAsset)
+	case errors.Is(err, errInvalid):
+		return nil, fmt.Sprintf("%s: latest release: %v", r.name, err)
+	case err != nil && prev != nil:
+		st := *prev
+		st.Source = r.source
+		return &st, fmt.Sprintf("%s: %v (keeping previous versions)", r.name, err)
+	case err != nil:
+		return nil, fmt.Sprintf("%s: %v", r.name, err)
+	}
+
+	st := &repoState{Repo: r.name, Source: r.source, Latest: m.Plugins}
+	if prev != nil {
+		st.Releases, st.Complete, st.Stale = prev.Releases, prev.Complete, prev.Stale
+	}
+	if !needsHistory(prev, m.Plugins) {
+		return st, ""
+	}
+	if err := d.updateReleases(ctx, st); err != nil {
+		st.Stale = true
+		return st, fmt.Sprintf("%s: release history: %v (will retry)", r.name, err)
+	}
+	return st, ""
+}
+
+// needsHistory reports whether the release list must be fetched: on the
+// first sight of a repo, after a failed fetch, and when the latest release
+// has a plugin version that wasn't there before. A latest release that only
+// rebuilt the same versions (a new hash) needs no API request.
+func needsHistory(prev *repoState, latest []Plugin) bool {
+	if prev == nil || !prev.Complete || prev.Stale {
+		return true
+	}
+	for _, p := range latest {
+		if !slices.ContainsFunc(prev.Latest, func(q Plugin) bool { return q.Name == p.Name && q.Version == p.Version }) {
+			return true
 		}
 	}
-	hist, err := d.fetchHistory(ctx, e.Repo, e.Manifest, known)
-	if err != nil {
-		// Degrade gracefully: latest plus whatever older versions we knew.
-		hist = []Manifest{e.Manifest}
-		for _, k := range known {
-			if compareSemver(k.Version, e.Manifest.Version) < 0 {
-				hist = append(hist, k)
-			}
-		}
-		e.History = hist
-		return e, err
-	}
-	e.History, e.HistoryComplete = hist, true
-	return e, nil
+	return false
 }
 
 type ghRelease struct {
-	TagName    string `json:"tag_name"`
-	Draft      bool   `json:"draft"`
-	Prerelease bool   `json:"prerelease"`
-	Assets     []struct {
-		Name string `json:"name"`
-		URL  string `json:"browser_download_url"`
-	} `json:"assets"`
+	ID         int64     `json:"id"`
+	TagName    string    `json:"tag_name"`
+	Draft      bool      `json:"draft"`
+	Prerelease bool      `json:"prerelease"`
+	Assets     []ghAsset `json:"assets"`
 }
 
-// fetchHistory returns latest plus all older stable releases of the same
-// plugin, newest first. Manifests in known are reused instead of downloaded.
-func (d *Discoverer) fetchHistory(ctx context.Context, repo string, latest Manifest, known []Manifest) ([]Manifest, error) {
-	body, err := d.getAPI(ctx, fmt.Sprintf("%s/repos/%s/releases?per_page=100", d.cfg.githubAPI, repo))
-	if err != nil {
-		return nil, err
+type ghAsset struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	URL  string `json:"browser_download_url"`
+}
+
+// updateReleases refreshes st.Releases from the release list, newest first.
+// If st.Releases already covers the whole list, it stops after the first page
+// that contains a known release and keeps the older records. Otherwise it
+// reads every page. Manifests are only downloaded for releases not seen yet.
+// On error, st is left unchanged.
+func (d *Discoverer) updateReleases(ctx context.Context, st *repoState) error {
+	known := map[int64]int{}
+	for i, rec := range st.Releases {
+		known[rec.ID] = i
 	}
-	var rels []ghRelease
-	if err := json.Unmarshal(body, &rels); err != nil {
-		return nil, fmt.Errorf("decoding release list: %w", err)
-	}
-	byVersion := map[string]Manifest{}
-	for _, k := range known {
-		byVersion[k.Version] = k
-	}
-	hist := []Manifest{latest}
-	seen := map[string]bool{latest.Version: true}
-	for _, rel := range rels {
-		v := strings.TrimPrefix(rel.TagName, "v")
-		if rel.Draft || rel.Prerelease || seen[v] || !semverRe.MatchString(v) || compareSemver(v, latest.Version) > 0 {
-			continue
+	var fresh []releaseRecord
+	seen := map[int64]bool{}
+	oldestKnown := -1
+	incremental := false
+	for page := 1; page <= maxReleasePages; page++ {
+		body, err := d.getAPI(ctx, fmt.Sprintf("%s/repos/%s/releases?per_page=%d&page=%d", d.cfg.githubAPI, st.Repo, releasesPerPage, page))
+		if err != nil {
+			return err
 		}
-		if k, ok := byVersion[v]; ok {
-			hist = append(hist, k)
-			seen[v] = true
-			continue
+		var rels []ghRelease
+		if err := json.Unmarshal(body, &rels); err != nil {
+			return fmt.Errorf("decoding release list: %w", err)
 		}
-		var url string
-		for _, a := range rel.Assets {
-			if a.Name == manifestAsset {
-				url = a.URL
+		hitKnown := false
+		for _, rel := range rels {
+			if rel.Draft || rel.Prerelease || seen[rel.ID] {
+				continue
+			}
+			seen[rel.ID] = true
+			i, isKnown := known[rel.ID]
+			if isKnown {
+				hitKnown = true
+				oldestKnown = max(oldestKnown, i)
+			}
+			ai := slices.IndexFunc(rel.Assets, func(a ghAsset) bool { return a.Name == manifestAsset })
+			if ai < 0 {
+				continue
+			}
+			asset := rel.Assets[ai]
+			if isKnown && st.Releases[i].Asset == asset.ID {
+				rec := st.Releases[i]
+				rec.Tag = rel.TagName
+				fresh = append(fresh, rec)
+				continue
+			}
+			rec := releaseRecord{ID: rel.ID, Tag: rel.TagName, Asset: asset.ID}
+			m, err := d.fetchManifestURL(ctx, asset.URL)
+			switch {
+			case errors.Is(err, errInvalid) || errors.Is(err, errNoRelease):
+				slog.Warn("ignoring release", "repo", st.Repo, "tag", rel.TagName, "err", err)
+				rec.Invalid = err.Error()
+			case err != nil:
+				return err
+			default:
+				rec.Plugins = m.Plugins
+			}
+			fresh = append(fresh, rec)
+		}
+		if len(rels) < releasesPerPage {
+			break
+		}
+		if hitKnown && st.Complete {
+			incremental = true
+			break
+		}
+	}
+	if incremental {
+		// Everything after the oldest release seen on these pages is older
+		// and was already processed. Known releases newer than that which
+		// are no longer listed were deleted and are dropped.
+		for _, rec := range st.Releases[oldestKnown+1:] {
+			if !seen[rec.ID] {
+				fresh = append(fresh, rec)
 			}
 		}
-		if url == "" {
-			continue // released before using the workflow
-		}
-		m, err := d.fetchManifestURL(ctx, url)
-		switch {
-		case errors.Is(err, errInvalid) || errors.Is(err, errNoRelease):
-			slog.Warn("skipping old release", "repo", repo, "tag", rel.TagName, "err", err)
-			continue
-		case err != nil:
-			return nil, err
-		case m.Version != v || m.Name != latest.Name:
-			slog.Warn("skipping old release with mismatched manifest", "repo", repo, "tag", rel.TagName, "name", m.Name, "version", m.Version)
-			continue
-		}
-		hist = append(hist, *m)
-		seen[v] = true
 	}
-	slices.SortStableFunc(hist, func(a, b Manifest) int { return compareSemver(b.Version, a.Version) })
-	return hist, nil
+	st.Releases, st.Complete, st.Stale = fresh, true, false
+	return nil
 }
 
 // compareSemver compares two SemVer strings (assumed valid) by precedence.

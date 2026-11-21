@@ -112,10 +112,10 @@ topics = ["decky-plugin"]
 
 | key | default | |
 |---|---|---|
-| `orgs` | `[]` | organizations whose plugin repos are offered |
-| `users` | `[]` | users whose own plugin repos are offered |
-| `repos` | `[]` | individual repos (`owner/repo` or GitHub URL), offered regardless of topics |
-| `topics` | `["decky-plugin"]` | a repo of an org or user is offered if it has at least one of these topics; must not be empty |
+| `orgs` | `[]` | organizations whose repos are searched for plugins |
+| `users` | `[]` | users whose own repos are searched for plugins |
+| `repos` | `[]` | individual repos (`owner/repo` or GitHub URL), searched regardless of topics |
+| `topics` | `["decky-plugin"]` | a repo of an org or user is searched if it has at least one of these topics; must not be empty |
 | `tokenFile` | unset | file with a GitHub token; falls back to `$GITHUB_TOKEN` |
 
 Without any `orgs`, `users` or `repos`, the proxy only passes requests through

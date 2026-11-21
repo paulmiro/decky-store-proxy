@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -100,7 +102,8 @@ type fakeGitHub struct {
 	failing   map[string]bool     // repo -> 500
 	releases  map[string][]fakeRelease
 	apiCalls  int // org listing
-	relCalls  int // release listing
+	relCalls  int // release listing pages
+	downloads int // old release manifest downloads
 	apiDown   bool
 }
 
@@ -108,6 +111,12 @@ type fakeRelease struct {
 	tag               string
 	prerelease, draft bool
 	manifest          string // "" = no decky-store.json asset
+}
+
+func fakeID(parts ...string) int64 {
+	h := fnv.New32a()
+	h.Write([]byte(strings.Join(parts, "\x00")))
+	return int64(h.Sum32())
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
@@ -145,19 +154,25 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 				w.WriteHeader(http.StatusForbidden)
 				return
 			}
+			var perPage, page int
+			fmt.Sscan(r.URL.Query().Get("per_page"), &perPage)
+			fmt.Sscan(r.URL.Query().Get("page"), &page)
+			rels := g.releases[repo]
+			lo, hi := min(len(rels), (page-1)*perPage), min(len(rels), page*perPage)
 			out := []map[string]any{}
-			for _, rel := range g.releases[repo] {
-				assets := []map[string]string{}
+			for _, rel := range rels[lo:hi] {
+				assets := []map[string]any{{"id": fakeID(repo, rel.tag, "zip"), "name": "plugin.zip", "browser_download_url": g.URL + "/zip"}}
 				if rel.manifest != "" {
-					assets = append(assets, map[string]string{"name": "decky-store.json", "browser_download_url": g.URL + "/assets/" + repo + "@" + rel.tag})
+					assets = append(assets, map[string]any{"id": fakeID(repo, rel.tag, rel.manifest), "name": "decky-store.json", "browser_download_url": g.URL + "/assets/" + repo + "@" + rel.tag})
 				}
-				out = append(out, map[string]any{"tag_name": rel.tag, "prerelease": rel.prerelease, "draft": rel.draft, "assets": assets})
+				out = append(out, map[string]any{"id": fakeID(repo, rel.tag), "tag_name": rel.tag, "prerelease": rel.prerelease, "draft": rel.draft, "assets": assets})
 			}
 			json.NewEncoder(w).Encode(out)
 			return
 		}
 		if rest, ok := strings.CutPrefix(r.URL.Path, "/assets/"); ok && strings.Contains(rest, "@") {
 			repo, tag, _ := strings.Cut(rest, "@")
+			g.downloads++
 			for _, rel := range g.releases[repo] {
 				if rel.tag == tag {
 					io.WriteString(w, rel.manifest)
@@ -190,21 +205,30 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 	return g
 }
 
-func manifest(name, version, repo, created string, tags ...string) string {
-	m := Manifest{
-		Schema: 1, Name: name, Version: version,
+// plugin returns a valid manifest entry. created may be "" (zero time).
+func plugin(name, version, repo, created string, tags ...string) Plugin {
+	p := Plugin{
+		Name: name, Version: version,
 		Artifact: "https://github.com/" + repo + "/releases/download/v" + version + "/plugin.zip",
 		SHA256:   strings.Repeat("ab", 32), Author: "me", Description: "desc " + name,
 		Tags: tags, ImageURL: "https://example.com/i.png",
 	}
-	b, _ := json.Marshal(m)
 	if created != "" {
-		var raw map[string]any
-		json.Unmarshal(b, &raw)
-		raw["created"] = created
-		b, _ = json.Marshal(raw)
+		if err := p.Created.UnmarshalText([]byte(created)); err != nil {
+			panic(err)
+		}
 	}
+	return p
+}
+
+func manifestOf(plugins ...Plugin) string {
+	b, _ := json.Marshal(Manifest{Schema: manifestSchema, Plugins: plugins})
 	return string(b)
+}
+
+// manifest returns a decky-store.json with a single plugin.
+func manifest(name, version, repo, created string, tags ...string) string {
+	return manifestOf(plugin(name, version, repo, created, tags...))
 }
 
 type harness struct {
@@ -336,7 +360,7 @@ func setupOrg(h *harness) {
 	h.gh.manifests["org/override"] = manifest("Overridden", "2.0.0", "org/override", "")
 	h.gh.manifests["org/archived"] = manifest("Archived", "1.0.0", "org/archived", "")
 	h.gh.manifests["org/no-topic"] = manifest("NoTopic", "1.0.0", "org/no-topic", "")
-	h.gh.manifests["org/broken"] = `{"schema":1,"name":"Broken","version":"v1.0.0"}`
+	h.gh.manifests["org/broken"] = `{"schema":2,"plugins":[{"name":"Broken","version":"v1.0.0"}]}`
 }
 
 func TestDiscoveryAndMerge(t *testing.T) {
@@ -346,7 +370,7 @@ func TestDiscoveryAndMerge(t *testing.T) {
 
 	var got []string
 	for _, e := range cat.Plugins {
-		got = append(got, e.Manifest.Name)
+		got = append(got, e.Latest.Name)
 	}
 	if fmt.Sprint(got) != "[Bravo Overridden]" {
 		t.Fatalf("catalog = %v, errors = %v", got, cat.Errors)
@@ -463,6 +487,14 @@ func TestCacheSurvivesRestart(t *testing.T) {
 	if !d3.Catalog().empty() {
 		t.Fatal("stale cached plugins kept")
 	}
+
+	// A cache written by another version is ignored.
+	os.WriteFile(d2.cachePath(), []byte(`{"version":1,"repos":{"org/plugin-b":{"repo":"org/plugin-b","source":"github:org:org","latest":[{"name":"Bravo"}]}}}`), 0o644)
+	d4 := newDiscoverer(h.cfg, &http.Client{})
+	d4.loadCache()
+	if !d4.Catalog().empty() {
+		t.Fatal("cache of another version loaded")
+	}
 }
 
 func TestConflicts(t *testing.T) {
@@ -566,7 +598,7 @@ func TestUsersAndTopics(t *testing.T) {
 
 	var got []string
 	for _, e := range cat.Plugins {
-		got = append(got, e.Manifest.Name+"="+e.Source)
+		got = append(got, e.Latest.Name+"="+e.Source)
 	}
 	if fmt.Sprint(got) != "[Bob=github:repo One=github:user:alice Two=github:user:alice]" {
 		t.Fatalf("got %v, errors %v", got, cat.Errors)
@@ -599,21 +631,27 @@ func TestUsersAndTopics(t *testing.T) {
 }
 
 func TestManifestValidation(t *testing.T) {
-	good := Manifest{Schema: 1, Name: "X", Version: "1.0.0-rc.1", SHA256: strings.Repeat("0", 64),
-		Artifact: "https://github.com/o/r/releases/download/v1.0.0-rc.1/x.zip"}
-	if err := good.validate(); err != nil {
-		t.Fatal(err)
+	good := func() Manifest {
+		return Manifest{Schema: 2, Plugins: []Plugin{
+			{Name: "X", Version: "1.0.0-rc.1", SHA256: strings.Repeat("0", 64), Artifact: "https://github.com/o/r/releases/download/v1/x.zip"},
+			{Name: "Y", Version: "2.0.0", SHA256: strings.Repeat("1", 64), Artifact: "https://github.com/o/r/releases/download/v1/y.zip"},
+		}}
+	}
+	if m := good(); m.validate() != nil {
+		t.Fatal(m.validate())
 	}
 	for _, mut := range []func(*Manifest){
-		func(m *Manifest) { m.Schema = 2 },
-		func(m *Manifest) { m.Version = "v1.0.0" },
-		func(m *Manifest) { m.SHA256 = strings.Repeat("A", 64) },
-		func(m *Manifest) { m.Artifact = "http://github.com/o/r/releases/download/x" },
-		func(m *Manifest) { m.Artifact = "https://evil.example/o/r/releases/download/x" },
-		func(m *Manifest) { m.Name = "a/b" },
-		func(m *Manifest) { m.ImageURL = "http://x" },
+		func(m *Manifest) { m.Schema = 1 },
+		func(m *Manifest) { m.Plugins = nil },
+		func(m *Manifest) { m.Plugins[1].Name = "X" },
+		func(m *Manifest) { m.Plugins[1].Version = "v1.0.0" },
+		func(m *Manifest) { m.Plugins[1].SHA256 = strings.Repeat("A", 64) },
+		func(m *Manifest) { m.Plugins[1].Artifact = "http://github.com/o/r/releases/download/x" },
+		func(m *Manifest) { m.Plugins[1].Artifact = "https://evil.example/o/r/releases/download/x" },
+		func(m *Manifest) { m.Plugins[1].Name = "a/b" },
+		func(m *Manifest) { m.Plugins[1].ImageURL = "http://x" },
 	} {
-		m := good
+		m := good()
 		mut(&m)
 		if m.validate() == nil {
 			t.Errorf("accepted %+v", m)
@@ -703,5 +741,143 @@ func TestCompareSemver(t *testing.T) {
 				t.Errorf("compare(%s, %s) = %d, want sign %d", ordered[i], ordered[j], got, want)
 			}
 		}
+	}
+}
+
+// A project releasing several packages at once: tags don't match plugin
+// versions, plugin versions repeat across releases, and a release can carry
+// several plugins.
+func TestMultiPluginProject(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.Sources.GitHub.Repos = []string{"o/project"} })
+	const r = "o/project"
+	rel := func(tag string, plugins ...Plugin) fakeRelease {
+		return fakeRelease{tag: tag, manifest: manifestOf(plugins...)}
+	}
+	a1 := plugin("A", "1.0.0", r, "2026-01-01T00:00:00Z")
+	a1rebuilt := a1
+	a1rebuilt.SHA256, a1rebuilt.Created = strings.Repeat("cd", 32), a1.Created.AddDate(0, 1, 0)
+	a2 := plugin("A", "1.1.0", r, "2026-03-01T00:00:00Z")
+	b1 := plugin("B", "0.1.0", r, "2026-03-01T00:00:00Z")
+	h.gh.releases[r] = []fakeRelease{
+		rel("project-3.0.0", a2, b1),
+		rel("project-2.0.0", a1rebuilt),
+		{tag: "project-1.5.0"}, // a release without the plugins
+		rel("project-1.0.0", a1),
+	}
+	h.gh.manifests[r] = h.gh.releases[r][0].manifest
+
+	cat := h.disc.Refresh(context.Background())
+	a, b := cat.lookup("A"), cat.lookup("B")
+	if a == nil || b == nil || len(cat.Errors) != 0 {
+		t.Fatalf("plugins = %+v, errors = %v", cat.Plugins, cat.Errors)
+	}
+	var vs []string
+	for _, v := range a.History {
+		vs = append(vs, v.Version+"/"+v.SHA256[:2]+"/"+v.Created.Format("01"))
+	}
+	// 1.0.0 is in two releases: the newer copy, with the older creation time.
+	if fmt.Sprint(vs) != "[1.1.0/ab/03 1.0.0/cd/01]" || !a.HistoryComplete {
+		t.Fatalf("A history = %v", vs)
+	}
+	if len(b.History) != 1 || a.id() == b.id() {
+		t.Fatalf("B = %+v", b)
+	}
+
+	// Next project release rebuilds the same plugin versions (new hashes):
+	// no API request, the new copies are served.
+	a2r, b1r := a2, b1
+	a2r.SHA256, b1r.SHA256 = strings.Repeat("ef", 32), strings.Repeat("ef", 32)
+	h.gh.mu.Lock()
+	h.gh.releases[r] = append([]fakeRelease{rel("project-3.0.1", a2r, b1r)}, h.gh.releases[r]...)
+	h.gh.manifests[r] = h.gh.releases[r][0].manifest
+	calls := h.gh.relCalls
+	h.gh.mu.Unlock()
+	cat = h.disc.Refresh(context.Background())
+	if h.gh.relCalls != calls {
+		t.Fatalf("release list fetched for a rebuild")
+	}
+	if e := cat.lookup("A"); e.Latest.SHA256 != a2r.SHA256 || e.History[0].SHA256 != a2r.SHA256 || len(e.History) != 2 {
+		t.Fatalf("A = %+v", e)
+	}
+
+	// A plugin dropped from the latest release disappears.
+	h.gh.mu.Lock()
+	h.gh.releases[r] = append([]fakeRelease{rel("project-4.0.0", a2r)}, h.gh.releases[r]...)
+	h.gh.manifests[r] = h.gh.releases[r][0].manifest
+	h.gh.mu.Unlock()
+	if cat = h.disc.Refresh(context.Background()); cat.lookup("B") != nil || cat.lookup("A") == nil {
+		t.Fatalf("plugins = %+v", cat.Plugins)
+	}
+}
+
+// Long release lists are read completely once, then only the newest page.
+func TestReleasePagination(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.Sources.GitHub.Repos = []string{"o/p"} })
+	var rels []fakeRelease
+	for i := 250; i >= 1; i-- {
+		v := fmt.Sprintf("1.0.%d", i)
+		rels = append(rels, fakeRelease{tag: "v" + v, manifest: manifest("P", v, "o/p", "")})
+	}
+	h.gh.releases["o/p"] = rels
+	h.gh.manifests["o/p"] = rels[0].manifest
+
+	cat := h.disc.Refresh(context.Background())
+	if e := cat.lookup("P"); e == nil || len(e.History) != 250 || e.History[249].Version != "1.0.1" {
+		t.Fatalf("history: %+v %v", e, cat.Errors)
+	}
+	if h.gh.relCalls != 3 || h.gh.downloads != 250 {
+		t.Fatalf("cold start: %d pages, %d downloads", h.gh.relCalls, h.gh.downloads)
+	}
+
+	// A new version, and an old release (on page 1) deleted.
+	h.gh.mu.Lock()
+	rels = append([]fakeRelease{{tag: "v1.0.251", manifest: manifest("P", "1.0.251", "o/p", "")}}, rels...)
+	rels = slices.Delete(rels, 3, 4) // v1.0.248
+	h.gh.releases["o/p"] = rels
+	h.gh.manifests["o/p"] = rels[0].manifest
+	h.gh.mu.Unlock()
+	cat = h.disc.Refresh(context.Background())
+	e := cat.lookup("P")
+	if h.gh.relCalls != 4 || h.gh.downloads != 251 {
+		t.Fatalf("incremental: %d pages, %d downloads", h.gh.relCalls, h.gh.downloads)
+	}
+	has := func(v string) bool {
+		return slices.ContainsFunc(e.History, func(p Plugin) bool { return p.Version == v })
+	}
+	if len(e.History) != 250 || !has("1.0.251") || has("1.0.248") || !has("1.0.1") || !e.HistoryComplete {
+		t.Fatalf("history after update: %d versions", len(e.History))
+	}
+
+	// The release records survive a restart: no downloads again.
+	d2 := newDiscoverer(h.cfg, &http.Client{})
+	d2.loadCache()
+	h.gh.mu.Lock()
+	rels = append([]fakeRelease{{tag: "v1.0.252", manifest: manifest("P", "1.0.252", "o/p", "")}}, rels...)
+	h.gh.releases["o/p"] = rels
+	h.gh.manifests["o/p"] = rels[0].manifest
+	h.gh.mu.Unlock()
+	cat = d2.Refresh(context.Background())
+	if e := cat.lookup("P"); h.gh.relCalls != 5 || h.gh.downloads != 252 || len(e.History) != 251 {
+		t.Fatalf("after restart: %d pages, %d downloads, %d versions", h.gh.relCalls, h.gh.downloads, len(e.History))
+	}
+}
+
+// TestManifestFile validates a decky-store.json written by the packaging
+// action (CI sets DECKY_STORE_MANIFEST).
+func TestManifestFile(t *testing.T) {
+	p := os.Getenv("DECKY_STORE_MANIFEST")
+	if p == "" {
+		t.Skip("DECKY_STORE_MANIFEST not set")
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m Manifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.validate(); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -37,32 +37,44 @@ Every `refreshInterval`, and on `POST /_proxy/refresh`:
    topic are listed through the GitHub API, using ETags. Repos from `repos`
    are added without the topic check.
 2. For each repo, `https://github.com/<repo>/releases/latest/download/decky-store.json`
-   is downloaded. This is a normal download, not an API call. Missing or
-   invalid manifests are logged and the repo is skipped.
+   is downloaded. This is a normal download, not an API call. Every plugin in
+   it is offered. Missing or invalid manifests are logged and the repo is
+   skipped.
 3. Decky's store card looks up the installed version in the plugin's version
-   list; if it isn't there, an update is labelled as a downgrade. So when a
-   repo's latest release changes, its release list is fetched once through the
-   API (`/repos/{repo}/releases`) and the manifests of older stable releases
-   are added. Unchanged repos cost no API calls.
+   list; if it isn't there, an update is labelled as a downgrade. So the
+   proxy keeps a record of each repo's stable releases with a
+   `decky-store.json`, and builds every plugin's version list from them,
+   matched by plugin name. The release list (`/repos/{repo}/releases`) is
+   fetched through the API only when the latest release has a plugin version
+   that wasn't there before. A release that only rebuilt the same versions, or
+   an unchanged repo, costs no API calls.
+   - The first fetch reads all pages of the release list. Later fetches stop
+     at the first page with an already known release, and keep the older
+     records. Known releases on the fetched pages that are no longer listed
+     are dropped.
+   - Each release's manifest is downloaded once, and again only if its asset
+     is replaced.
 4. Name conflicts are resolved: `repos` beat org and user repos; two org/user
-   repos with the same name are both dropped.
+   repos with a plugin of the same name are both dropped.
 
 Failures don't empty the store:
 
 - If listing an org or user fails, its previously found plugins are kept.
-- If a manifest can't be downloaded, the repo's previous entry is kept.
-- If the release history can't be fetched, the known versions are kept and
-  the fetch is retried on the next refresh.
-- The catalog is saved to `cacheDir/catalog.json` and loaded on start, so the
-  store also works across restarts and while GitHub is unreachable. Cached
-  plugins whose source is no longer configured are dropped.
+- If a manifest can't be downloaded, the repo's previous plugins are kept.
+- If the release list can't be fetched, the known versions are kept and the
+  fetch is retried on the next refresh.
+- The state of every repo, including its release records, is saved to
+  `cacheDir/catalog.json` and loaded on start, so the store also works across
+  restarts and while GitHub is unreachable, and no manifest is downloaded
+  twice. Cached repos whose source is no longer configured are dropped.
 
 ## Merging
 
 - `GET /plugins`: upstream plugins with the same name as a custom plugin are
   removed. Custom plugins are inserted into the upstream list according to
   `sort_by` (`name`, `date` or `downloads`) and `sort_direction`, without
-  reordering upstream entries. They get stable negative ids. The `query` and
+  reordering upstream entries. They get stable negative ids, derived from the
+  repo and the plugin name. The `query` and
   `tags` filters are applied to custom plugins too. If upstream is down, only
   custom plugins are listed; upstream 4xx responses (e.g. 426 for old Decky
   versions) are passed through.
@@ -83,3 +95,7 @@ nix flake check
 
 `nix develop` provides Go and gopls. The flake's `checks.<system>.module`
 builds the systemd unit from an example NixOS configuration.
+
+The packaging action lives in `actions/package-plugin/`: `package.sh` builds
+the zip and `decky-store.json`, `release.sh` publishes them. CI runs it on
+fixture plugins and validates the result with the proxy's manifest checks.

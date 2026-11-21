@@ -239,7 +239,7 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request, cat *Cat
 		}
 	}
 	for _, e := range cat.Plugins {
-		m := e.Manifest
+		m := e.Latest
 		merged[m.Name] = []string{m.Version, m.SHA256, m.Artifact}
 	}
 	writeJSON(w, r, merged)
@@ -247,7 +247,7 @@ func (s *Server) handleVersions(w http.ResponseWriter, r *http.Request, cat *Cat
 
 // storeEntry renders a custom plugin in the upstream store's list format.
 func storeEntry(e *Entry) map[string]any {
-	m := e.Manifest
+	m := e.Latest
 	ts := func(t time.Time) any {
 		if t.IsZero() {
 			return nil
@@ -346,10 +346,10 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, cat *Catalog
 	var custom []map[string]json.RawMessage
 	for i := range cat.Plugins {
 		e := &cat.Plugins[i]
-		if query != "" && !strings.Contains(strings.ToLower(e.Manifest.Name), query) {
+		if query != "" && !strings.Contains(strings.ToLower(e.Latest.Name), query) {
 			continue
 		}
-		if !hasAllTags(e.Manifest.Tags, tags) {
+		if !hasAllTags(e.Latest.Tags, tags) {
 			continue
 		}
 		raw := map[string]json.RawMessage{}
@@ -423,7 +423,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		for _, v := range e.versions() {
 			vs = append(vs, v.Version)
 		}
-		ps = append(ps, plugin{e.Manifest.Name, e.Manifest.Version, vs, e.HistoryComplete, e.Repo, e.Source, e.Manifest.Artifact})
+		ps = append(ps, plugin{e.Latest.Name, e.Latest.Version, vs, e.HistoryComplete, e.Repo, e.Source, e.Latest.Artifact})
 	}
 	nonNil := func(l []string) []string {
 		if l == nil {

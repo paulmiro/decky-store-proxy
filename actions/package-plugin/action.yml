@@ -1,0 +1,79 @@
+name: Package Decky plugin
+description: >-
+  Packages a built Decky plugin for decky-store-proxy: a reproducible zip in
+  Decky's install layout and a decky-store.json manifest. Optionally creates
+  the GitHub release or uploads to an existing one.
+
+inputs:
+  plugin-dir:
+    description: Directory with plugin.json, package.json and the built dist/, relative to the workspace.
+    default: "."
+  tag:
+    description: Tag of the release the files are attached to. Defaults to the pushed tag.
+    default: ""
+  zip-name:
+    description: File name of the zip. Defaults to <repo>-decky-plugin.zip.
+    default: ""
+  folder-name:
+    description: Name of the plugin folder inside the zip. Defaults to plugin.json's name in lowercase, with every run of other characters replaced by "-".
+    default: ""
+  extra-files:
+    description: Extra files or directories (space-separated, relative to plugin-dir) to include in the plugin folder.
+    default: ""
+  output-dir:
+    description: Where the zip and decky-store.json are written. Packaging several plugins into the same directory lists them all in one decky-store.json. Defaults to $RUNNER_TEMP/decky-store.
+    default: ""
+  release:
+    description: >-
+      "none": only write the files.
+      "create": create the release for the pushed tag, which must be "v" + package.json version.
+      "upload": upload the zip and decky-store.json to the existing release `tag`, replacing a previous decky-store.json.
+    default: none
+  token:
+    description: GitHub token used for "create" and "upload".
+    default: ${{ github.token }}
+
+outputs:
+  name:
+    description: plugin.json name
+    value: ${{ steps.package.outputs.name }}
+  version:
+    description: package.json version
+    value: ${{ steps.package.outputs.version }}
+  zip:
+    description: Path of the zip
+    value: ${{ steps.package.outputs.zip }}
+  manifest:
+    description: Path of decky-store.json
+    value: ${{ steps.package.outputs.manifest }}
+  output-dir:
+    description: Directory containing the zip(s) and decky-store.json
+    value: ${{ steps.package.outputs.output-dir }}
+
+runs:
+  using: composite
+  steps:
+    - id: package
+      shell: bash
+      env:
+        PLUGIN_DIR: ${{ inputs.plugin-dir }}
+        TAG: ${{ inputs.tag }}
+        ZIP_NAME: ${{ inputs.zip-name }}
+        FOLDER_NAME: ${{ inputs.folder-name }}
+        EXTRA_FILES: ${{ inputs.extra-files }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        RELEASE: ${{ inputs.release }}
+      run: bash "$GITHUB_ACTION_PATH/package.sh"
+
+    - if: inputs.release != 'none'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        RELEASE: ${{ inputs.release }}
+        PLUGIN_DIR: ${{ inputs.plugin-dir }}
+        TAG: ${{ steps.package.outputs.tag }}
+        NAME: ${{ steps.package.outputs.name }}
+        VERSION: ${{ steps.package.outputs.version }}
+        ZIP: ${{ steps.package.outputs.zip }}
+        MANIFEST: ${{ steps.package.outputs.manifest }}
+      run: bash "$GITHUB_ACTION_PATH/release.sh"

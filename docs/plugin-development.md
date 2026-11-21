@@ -1,29 +1,35 @@
 # Publishing plugins for decky-store-proxy
 
-The proxy offers a plugin if its GitHub repository publishes releases in the
-format below. The reusable release workflow in this repository produces that
-format, so normally all a plugin needs is a small workflow file.
+The proxy offers the plugins from a GitHub repository if its releases carry a
+`decky-store.json` in the format below. The packaging action in this
+repository produces that format. It works both for repositories that only
+contain a plugin and for larger projects that ship one or more Decky plugins
+as part of a bigger release.
 
 ## Requirements
 
-A plugin repository must:
+A repository with plugins must:
 
-1. Be **public**. Decky downloads the plugin zip without credentials.
+1. Be **public**. Decky downloads the plugin zips without credentials.
 2. Be reachable through a source in the user's configuration:
    - owned by a configured org or user **and** tagged with one of the
      configured topics (by default `decky-plugin`), or
    - listed explicitly in `repos` (no topic needed).
-3. Have `package.json` and `plugin.json` at the root, as in the
+3. Have, for each plugin, a directory (the repository root or any
+   subdirectory) with `package.json` and `plugin.json`, as in the
    [Decky plugin template](https://github.com/SteamDeckHomebrew/decky-plugin-template):
    - `package.json` `version` is the plugin version, in strict SemVer
      (`1.2.3`, no leading `v`).
    - `plugin.json` `name` is the plugin's identity. Decky matches installed
-     plugins to store entries by this name, so it must never change.
-4. Release through the reusable workflow (or produce the same assets).
+     plugins to store entries by this name, so it must never change, and it
+     must be unique among all plugins a user's sources offer.
+4. Package every plugin with the action (or produce the same files) in every
+   release that is marked as the latest release.
 5. Work on NixOS as well as SteamOS. See [Working on NixOS](#working-on-nixos).
 
-## Releasing
+## Releasing a plugin repository
 
+For a repository that is only a plugin, every release is a plugin release.
 Add `.github/workflows/release.yml`:
 
 ```yaml
@@ -38,7 +44,17 @@ permissions:
 
 jobs:
   release:
-    uses: paulmiro/decky-store-proxy/.github/workflows/release-plugin.yml@<commit-sha>
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile && pnpm run build
+      - uses: paulmiro/decky-store-proxy/actions/package-plugin@<commit-sha>
+        with:
+          release: create
 ```
 
 Pinning a commit SHA is recommended; `@main` also works.
@@ -50,74 +66,127 @@ push:
 git tag v1.2.3 && git push origin main v1.2.3
 ```
 
-The workflow:
+With `release: create`, the action fails unless the tag equals `v` +
+`package.json` version. Prerelease tags such as `v1.3.0-rc.1` become GitHub
+prereleases. A backport released after a newer version (for example `v1.2.4`
+after `v1.3.0`) is not marked as the latest release. Neither of them reaches
+the store as the current version.
 
-- fails unless the tag equals `v` + `package.json` version;
-- builds the frontend with `pnpm install --frozen-lockfile && pnpm run build`;
-- packages `<repo>.zip` in Decky's install layout, reproducibly;
+## Releasing from a larger project
+
+A project that releases several packages together, for example a shared core
+with several frontends, can include its Decky plugins in that release. Build
+the plugins as part of the project's own release job, then run the action once
+per plugin:
+
+```yaml
+      # ... after the project's release has been created
+      - uses: paulmiro/decky-store-proxy/actions/package-plugin@<commit-sha>
+        with:
+          plugin-dir: frontends/decky
+          release: upload
+      - uses: paulmiro/decky-store-proxy/actions/package-plugin@<commit-sha>
+        with:
+          plugin-dir: frontends/decky-extras
+          zip-name: myproject-decky-extras.zip
+          release: upload
+```
+
+Each call adds its plugin to the same `decky-store.json`, so the release lists
+all of them. With `release: none`, the action only writes the files to
+`output-dir` and the project uploads the whole directory itself.
+
+The plugin versions don't need to match the release tag:
+
+- A plugin can keep its version when the project releases. The store then
+  offers no update for it. Bump the plugin's version whenever it changes,
+  or users never get the change.
+- Every release marked as the latest must contain all plugins. A plugin
+  missing from the latest release disappears from the store, and if the
+  latest release has no `decky-store.json` at all, none of the project's
+  plugins are offered.
+- Projects that publish separate releases for their parts, with the Decky
+  plugin in only some of them, are not supported.
+
+## The action
+
+`paulmiro/decky-store-proxy/actions/package-plugin`:
+
+- checks `package.json` and `plugin.json`, and that the plugin has been
+  built (`dist/index.js`);
+- packages the plugin as a zip in Decky's install layout, reproducibly;
 - fails if the zip contains anything that can't work on NixOS (see
-  [Checked by the workflow](#checked-by-the-workflow));
-- writes `decky-store.json`;
-- creates the GitHub release with both files.
-
-Inputs:
+  [Checked by the action](#checked-by-the-action));
+- writes `decky-store.json`, or adds the plugin to an existing one in
+  `output-dir`;
+- optionally creates the release or uploads to an existing one.
 
 | input | default | |
 |---|---|---|
-| `build-command` | `pnpm install --frozen-lockfile && pnpm run build` | must produce `dist/index.js` |
-| `node-version` | `22` | |
-| `extra-files` | `""` | space-separated extra files or directories to include |
+| `plugin-dir` | `.` | directory with `plugin.json`, `package.json` and the built `dist/` |
+| `tag` | the pushed tag | release the files are attached to |
+| `zip-name` | `<repo>-decky-plugin.zip` | must differ for each plugin in a release |
+| `folder-name` | `plugin.json` `name` in lowercase, with every run of other characters replaced by `-` | the plugin's folder inside the zip, and in Decky's plugin directory |
+| `extra-files` | `""` | space-separated extra files or directories (relative to `plugin-dir`) to include |
+| `output-dir` | `$RUNNER_TEMP/decky-store` | where the zips and `decky-store.json` are written |
+| `release` | `none` | `none`: only write the files; `create`: create the release for the pushed tag `v<version>` with both files; `upload`: upload both files to the existing release `tag`, replacing its `decky-store.json` |
+| `token` | `github.token` | for `create` and `upload`; needs `contents: write` |
+
+Outputs: `name`, `version`, `zip`, `manifest` and `output-dir`.
 
 The zip contains `dist/`, `package.json`, `plugin.json` and, if present,
 `main.py`, `README*`, `LICENSE*`, `py_modules/`, the contents of `defaults/`, and
-`backend/out/` as `bin/`.
-
-Prerelease tags such as `v1.3.0-rc.1` become GitHub prereleases. A backport
-released after a newer version (for example `v1.2.4` after `v1.3.0`) is not
-marked as the latest release. Neither of them reaches the store as the current
-version.
+`backend/out/` as `bin/`, all taken from `plugin-dir`.
 
 ## Release format
 
-Each release has two assets:
+A release offers plugins through two kinds of assets:
 
-- `<repo>.zip`: the plugin, in Decky's install layout (a single top-level
-  folder containing `plugin.json`).
-- `decky-store.json`, schema 1:
+- one zip per plugin, in Decky's install layout (a single top-level folder
+  containing `plugin.json`);
+- `decky-store.json`, schema 2, listing every plugin in the release:
 
 ```json
 {
-  "schema": 1,
-  "name": "My Plugin",
-  "version": "1.4.0",
-  "artifact": "https://github.com/org/my-plugin/releases/download/v1.4.0/my-plugin.zip",
-  "sha256": "<lowercase hex sha256 of the zip>",
-  "author": "me",
-  "description": "",
-  "tags": [],
-  "image_url": "",
-  "created": "2026-01-01T00:00:00Z"
+  "schema": 2,
+  "plugins": [
+    {
+      "name": "My Plugin",
+      "version": "1.4.0",
+      "artifact": "https://github.com/org/my-project/releases/download/v3.0.0/my-project-decky-plugin.zip",
+      "sha256": "<lowercase hex sha256 of the zip>",
+      "author": "me",
+      "description": "",
+      "tags": [],
+      "image_url": "",
+      "created": "2026-01-01T00:00:00Z"
+    }
+  ]
 }
 ```
 
 | field | |
 |---|---|
-| `name` | equal to `plugin.json` `name` |
+| `name` | equal to `plugin.json` `name`; unique within the manifest |
 | `version` | strict SemVer, equal to `package.json` `version` |
 | `artifact` | `https://github.com/.../releases/download/...` URL of the zip |
 | `sha256` | checked by Decky before installing |
 | `author` | from `plugin.json` `author` |
 | `description`, `tags`, `image_url` | from `plugin.json` `publish.description`, `publish.tags`, `publish.image`; `image_url` must be `https` if set |
-| `created` | release time, used when the store is sorted by date |
+| `created` | build time; used when the store is sorted by date |
 
-The store shows the latest release as the current version. All other stable
-releases with a `decky-store.json` (from the newest 100 releases) are offered
-as older versions; prereleases and releases without a valid manifest are
-ignored. If the latest release has no valid manifest, the plugin is not offered
-at all, and the proxy reports the problem in `/_proxy/status`.
+The store offers each plugin in the latest release's manifest, with that
+release's version as the current one. The plugin's older versions are
+collected from the manifests of all other stable releases, matched by name.
+If several releases contain the same version, the newest release's zip is
+offered, with the `created` time of the oldest. Versions newer than the
+current one, prereleases, drafts and releases without a valid manifest are
+ignored. If the latest release's manifest is missing or invalid, the
+repository offers no plugins, and the proxy reports the problem in
+`/_proxy/status`.
 
 Plugins from third parties that don't publish this format can be forked and
-released through the workflow.
+released with the action.
 
 ## Working on NixOS
 
@@ -213,10 +282,10 @@ anything it runs.
 - Call executables by name (resolved through `PATH`) or by their path inside
   the plugin directory, never by an absolute system path such as `/usr/bin/…`.
 
-### Checked by the workflow
+### Checked by the action
 
-The release workflow inspects every file in the zip and fails the release if
-it finds:
+The action inspects every file in the zip and fails, before anything is
+released, if it finds:
 
 - an ELF executable that requests a dynamic loader, or any ELF file (including
   compiled Python modules) that depends on shared libraries;
@@ -238,7 +307,9 @@ Anyone who can publish a release in a configured source can ship code that
 Decky runs on users' machines, often as root. For an org that serves plugins:
 
 - enable **immutable releases**, so a replaced asset can't break the hash or
-  swap out a plugin;
+  swap out a plugin. Assets can then only be added before a release is
+  published: with `release: upload`, create the release as a draft and
+  publish it after the action ran;
 - add tag rulesets so only maintainers can push `v*` tags;
 - protect the default branch and require reviews;
 - keep membership small.

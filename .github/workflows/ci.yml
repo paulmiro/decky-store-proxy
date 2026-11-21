@@ -22,3 +22,46 @@ jobs:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v31
       - run: nix flake check -L
+
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create plugin fixtures
+        run: |
+          for p in a b bad; do
+            mkdir -p "fixture/$p/dist"
+            echo 'export default {}' > "fixture/$p/dist/index.js"
+            echo '{"version": "1.0.0"}' > "fixture/$p/package.json"
+            echo "{\"name\": \"Fixture $p\", \"author\": \"ci\"}" > "fixture/$p/plugin.json"
+          done
+          mkdir -p "fixture/bad/backend/out"
+          printf '#!/bin/bash\necho hi\n' > "fixture/bad/backend/out/helper"
+      - id: a
+        uses: ./actions/package-plugin
+        with:
+          plugin-dir: fixture/a
+          tag: v1.0.0
+      - uses: ./actions/package-plugin
+        with:
+          plugin-dir: fixture/b
+          tag: v1.0.0
+          zip-name: b.zip
+      - id: bad
+        continue-on-error: true
+        uses: ./actions/package-plugin
+        with:
+          plugin-dir: fixture/bad
+          tag: v1.0.0
+          output-dir: ${{ runner.temp }}/bad
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check results
+        env:
+          MANIFEST: ${{ steps.a.outputs.manifest }}
+          BAD: ${{ steps.bad.outcome }}
+        run: |
+          [[ "$BAD" == failure ]] || { echo "::error::the NixOS check did not reject fixture/bad"; exit 1; }
+          jq -e '.plugins | map(.name) == ["Fixture a", "Fixture b"]' "$MANIFEST"
+          DECKY_STORE_MANIFEST="$MANIFEST" go test -run TestManifestFile -v .
