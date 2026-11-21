@@ -128,6 +128,46 @@ jobs:
           echo "sha256=$(sha256sum "$zip" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           unzip -l "$zip"
 
+      # Plugins must also work on NixOS, which has no dynamic loader at
+      # /lib64 and no bash on Decky's PATH. See docs/plugin-development.md.
+      - name: Check NixOS compatibility
+        shell: bash
+        env:
+          REPO_NAME: ${{ steps.meta.outputs.repo_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/stage"
+          failed=0
+          fail() { echo "::error title=NixOS compatibility::$1: $2"; failed=1; }
+
+          while IFS= read -r -d '' f; do
+            if [[ "$(head -c 4 "$f" | od -An -tx1 | tr -d ' \n')" == 7f454c46 ]]; then
+              # ELF: must not need a dynamic loader or shared libraries.
+              if readelf -lW "$f" 2>/dev/null | grep -q 'Requesting program interpreter'; then
+                fail "$f" "dynamically linked executable; build it statically"
+              elif readelf -dW "$f" 2>/dev/null | grep -q '(NEEDED)'; then
+                fail "$f" "depends on shared libraries ($(readelf -dW "$f" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | paste -sd, -)); build it statically, and don't ship compiled Python modules"
+              fi
+            elif [[ "$(head -c 2 "$f")" == '#!' && "$f" != *.py ]]; then
+              # Scripts: only POSIX sh is guaranteed to exist.
+              read -r -a cmd <<< "$(head -n 1 "$f" | cut -c3-)"
+              interp="${cmd[0]:-}"
+              if [[ "$interp" == /usr/bin/env ]]; then
+                interp="${cmd[1]:-}"
+                [[ "$interp" == -S ]] && interp="${cmd[2]:-}"
+              fi
+              if [[ "$interp" != /bin/sh && "$interp" != sh ]]; then
+                fail "$f" "uses interpreter '$(head -n 1 "$f" | cut -c3-)'; use #!/bin/sh (POSIX sh)"
+              fi
+            fi
+          done < <(find "$REPO_NAME" -type f -print0)
+
+          if [[ "$failed" == 1 ]]; then
+            echo "::error::The plugin would not work on NixOS. See https://github.com/paulmiro/decky-store-proxy/blob/main/docs/plugin-development.md#working-on-nixos"
+            exit 1
+          fi
+          echo "No dynamically linked binaries or unsupported script interpreters found."
+
       - name: Write decky-store.json
         id: manifest
         shell: bash

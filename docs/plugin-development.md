@@ -55,6 +55,8 @@ The workflow:
 - fails unless the tag equals `v` + `package.json` version;
 - builds the frontend with `pnpm install --frozen-lockfile && pnpm run build`;
 - packages `<repo>.zip` in Decky's install layout, reproducibly;
+- fails if the zip contains anything that can't work on NixOS (see
+  [Checked by the workflow](#checked-by-the-workflow));
 - writes `decky-store.json`;
 - creates the GitHub release with both files.
 
@@ -199,8 +201,10 @@ anything it runs.
     `zig cc -target x86_64-linux-musl`)
   - Check with `file <binary>` ("statically linked") or `ldd <binary>`
     ("not a dynamic executable").
-- Shell scripts must start with `#!/bin/sh` and be POSIX sh. `/bin/bash`
-  doesn't exist and `bash` isn't on Decky's `PATH`.
+- Shell scripts must start with `#!/bin/sh` (or `#!/usr/bin/env sh`) and be
+  POSIX sh. `/bin/bash` doesn't exist, and neither `bash` nor `python3` is on
+  Decky's `PATH`, so `#!/usr/bin/env bash` and `#!/usr/bin/env python3` fail
+  too.
 - Don't call system tools that aren't in the `PATH` above: no `curl`,
   `wget`, `unzip`, `tar`, `flatpak`, `pactl`, `steamos-*` helpers and so on.
   Prefer the standard library (`urllib`, `zipfile`, `tarfile`, `shutil`,
@@ -208,6 +212,19 @@ anything it runs.
   check for it with `shutil.which()` and degrade with a clear message.
 - Call executables by name (resolved through `PATH`) or by their path inside
   the plugin directory, never by an absolute system path such as `/usr/bin/…`.
+
+### Checked by the workflow
+
+The release workflow inspects every file in the zip and fails the release if
+it finds:
+
+- an ELF executable that requests a dynamic loader, or any ELF file (including
+  compiled Python modules) that depends on shared libraries;
+- a script whose interpreter is not `/bin/sh` or `sh` via `/usr/bin/env`.
+  Files ending in `.py` are exempt, because Decky imports them rather than
+  running them.
+
+Everything else in this section can't be checked automatically.
 
 ### Testing
 
