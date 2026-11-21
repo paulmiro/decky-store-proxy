@@ -1,0 +1,33 @@
+# Releases the Store Proxy Decky plugin in plugin/. It is also the example of
+# releasing a plugin with the packaging action, see docs/plugin-development.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that the plugin and the proxy have the same version
+        run: |
+          plugin=$(jq -r .version plugin/package.json)
+          proxy=$(sed -n 's/^ *version = "\(.*\)";/\1/p' nix/package.nix)
+          [[ "$plugin" == "$proxy" ]] || { echo "::error::plugin/package.json ($plugin) and nix/package.nix ($proxy) versions differ"; exit 1; }
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: plugin/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile && pnpm run build
+        working-directory: plugin
+      - uses: ./actions/package-plugin
+        with:
+          plugin-dir: plugin
+          release: create

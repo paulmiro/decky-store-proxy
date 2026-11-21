@@ -6,6 +6,10 @@ repository produces that format. It works both for repositories that only
 contain a plugin and for larger projects that ship one or more Decky plugins
 as part of a bigger release.
 
+[`plugin/`](../plugin) in this repository is a minimal example: a panel with a
+button that calls the plugin's Python backend, released by
+[`.github/workflows/release.yml`](../.github/workflows/release.yml).
+
 ## Requirements
 
 A repository with plugins must:

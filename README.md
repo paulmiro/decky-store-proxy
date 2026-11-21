@@ -85,6 +85,20 @@ In Decky, open Settings → General → Store Channel, choose **Custom** and ent
 
 Requires Decky Loader 3.3.0 or newer.
 
+## Refreshing from the Deck
+
+The *Store Proxy* plugin adds a button to Decky's Quick Access menu that makes
+the proxy check its sources right away, instead of waiting for
+`refreshInterval`. To get it, add this repository as a source:
+
+```toml
+[sources.github]
+repos = ["paulmiro/decky-store-proxy"]
+```
+
+Then install *Store Proxy* from the store. If the proxy doesn't run at
+`http://127.0.0.1:8737`, set its URL under *Settings* in the plugin.
+
 ## Configuration
 
 The configuration is a TOML file. Its default location is

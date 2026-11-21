@@ -65,3 +65,28 @@ jobs:
           [[ "$BAD" == failure ]] || { echo "::error::the NixOS check did not reject fixture/bad"; exit 1; }
           jq -e '.plugins | map(.name) == ["Fixture a", "Fixture b"]' "$MANIFEST"
           DECKY_STORE_MANIFEST="$MANIFEST" go test -run TestManifestFile -v .
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: plugin/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: pnpm install --frozen-lockfile && pnpm run build && pnpm exec tsc --noEmit
+        working-directory: plugin
+      - run: python3 -m py_compile plugin/main.py
+      - id: package
+        uses: ./actions/package-plugin
+        with:
+          plugin-dir: plugin
+          tag: v0.0.0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - env:
+          DECKY_STORE_MANIFEST: ${{ steps.package.outputs.manifest }}
+        run: go test -run TestManifestFile -v .

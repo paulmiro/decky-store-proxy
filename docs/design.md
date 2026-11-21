@@ -99,3 +99,8 @@ builds the systemd unit from an example NixOS configuration.
 The packaging action lives in `actions/package-plugin/`: `package.sh` builds
 the zip and `decky-store.json`, `release.sh` publishes them. CI runs it on
 fixture plugins and validates the result with the proxy's manifest checks.
+
+`plugin/` is the *Store Proxy* Decky plugin. Its Python backend sends
+`POST /_proxy/refresh` to the URL from its settings. To release it, set the
+same version in `plugin/package.json` and `nix/package.nix`, commit, and push
+the tag `v<version>`.

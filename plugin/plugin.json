@@ -1,0 +1,11 @@
+{
+  "name": "Store Proxy",
+  "author": "paulmiro",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility"],
+    "description": "Makes decky-store-proxy check its sources for new plugins and updates right away.",
+    "image": ""
+  }
+}
