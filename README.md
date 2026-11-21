@@ -33,7 +33,7 @@ imports = [ inputs.decky-store-proxy.nixosModules.default ];
 services.decky-store-proxy = {
   enable = true;
   settings.sources.github = {
-    orgs = [ "paulmiro-decky-store" ];
+    orgs = [ "some-org-name" ];
     # users = [ ];
     # repos = [ ];
   };

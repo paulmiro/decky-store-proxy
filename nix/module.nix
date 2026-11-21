@@ -74,7 +74,7 @@ in
                     orgs = lib.mkOption {
                       type = lib.types.listOf lib.types.str;
                       default = [ ];
-                      example = [ "paulmiro-decky-store" ];
+                      example = [ "some-org-name" ];
                       description = ''
                         GitHub organizations whose public, non-archived
                         repositories with one of `topics` are offered.
